@@ -42,12 +42,24 @@ export type RuntimeLogEvent = {
   details?: string;
 };
 
+export type ServerSummary = {
+  serverId: string;
+  serverIdentifier: string;
+  url: string;
+  port: string;
+  collectionCount: number;
+  updatedAt: string;
+  isActive: boolean;
+};
+
 export type ServerConfigResponse = {
   runningServerSetup: ServerSetup | null;
   stagedServerSetup: ServerSetup | null;
   replicationEndpointTest: ReplicationEndpointTestResult | null;
   mongoConnectionTest: MongoConnectionTestResult | null;
   effectiveServerSetup: ServerSetup | null;
+  activeServerId: string | null;
+  servers: ServerSummary[];
 };
 
 function getAuthHeader(): string {
@@ -135,6 +147,8 @@ function normalizeServerConfigResponse(input: unknown): ServerConfigResponse {
     replicationEndpointTest?: unknown;
     mongoConnectionTest?: unknown;
     effectiveServerSetup?: unknown;
+    activeServerId?: unknown;
+    servers?: unknown;
   };
 
   const replicationEndpointTest =
@@ -153,6 +167,26 @@ function normalizeServerConfigResponse(input: unknown): ServerConfigResponse {
           error?: unknown;
         })
       : null;
+
+  const servers = Array.isArray(value.servers)
+    ? value.servers
+        .filter((entry): entry is ServerSummary => {
+          if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+            return false;
+          }
+          const cast = entry as Record<string, unknown>;
+          return (
+            typeof cast.serverId === "string" &&
+            typeof cast.serverIdentifier === "string" &&
+            typeof cast.url === "string" &&
+            typeof cast.port === "string" &&
+            typeof cast.collectionCount === "number" &&
+            typeof cast.updatedAt === "string" &&
+            typeof cast.isActive === "boolean"
+          );
+        })
+        .map((entry) => ({ ...entry }))
+    : [];
 
   return {
     runningServerSetup: normalizeNullableServerSetup(value.runningServerSetup),
@@ -179,7 +213,9 @@ function normalizeServerConfigResponse(input: unknown): ServerConfigResponse {
             error: mongoConnectionTest.error
           }
         : null,
-    effectiveServerSetup: normalizeNullableServerSetup(value.effectiveServerSetup)
+    effectiveServerSetup: normalizeNullableServerSetup(value.effectiveServerSetup),
+    activeServerId: typeof value.activeServerId === "string" ? value.activeServerId : null,
+    servers
   };
 }
 
@@ -190,6 +226,26 @@ export async function getServerConfig(): Promise<ServerConfigResponse> {
 
 export async function stageServerConfig(serverSetup: ServerSetup): Promise<ServerConfigResponse> {
   const result = await post("/api/server/config/stage", { serverSetup });
+  return normalizeServerConfigResponse(result);
+}
+
+export async function selectServer(serverId: string): Promise<ServerConfigResponse> {
+  const result = await post("/api/server/select", { serverId });
+  return normalizeServerConfigResponse(result);
+}
+
+export async function createServer(serverSetup: ServerSetup): Promise<ServerConfigResponse> {
+  const result = await post("/api/server/create", { serverSetup });
+  return normalizeServerConfigResponse(result);
+}
+
+export async function updateServer(serverId: string, serverSetup: ServerSetup): Promise<ServerConfigResponse> {
+  const result = await post("/api/server/update", { serverId, serverSetup });
+  return normalizeServerConfigResponse(result);
+}
+
+export async function deleteServer(serverId: string): Promise<ServerConfigResponse> {
+  const result = await post("/api/server/delete", { serverId });
   return normalizeServerConfigResponse(result);
 }
 

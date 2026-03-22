@@ -1,15 +1,19 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { User } from "lucide-vue-next";
 import {
   clearRuntimeLogs,
+  createServer,
+  deleteServer,
   type DeployValidationResult,
   getRuntimeLogs,
   getServerConfig,
   type MongoConnectionTestResult,
+  selectServer,
   type RuntimeLogEvent,
-  stageServerConfig,
+  type ServerSummary,
   validateDeploy,
+  updateServer,
   type ReplicationEndpointTestResult,
   type ServerConfigResponse,
   type ServerSetup
@@ -29,9 +33,11 @@ const DEFAULT_MONGODB_CONNECTION_STRING = import.meta.env.VITE_FRONTEND_DEFAULT_
 
 type WsServerStatus = {
   serverId: string;
+  activeServerId: string | null;
   status: string;
   hasStagedConfig: boolean;
   hasRunningConfig: boolean;
+  servers: ServerSummary[];
   replicationEndpointTest: ReplicationEndpointTestResult | null;
   mongoConnectionTest: MongoConnectionTestResult | null;
 };
@@ -58,6 +64,8 @@ const dropdownOpen = ref(false);
 const isCredentialsCardOpen = ref(false);
 const isSetupCardOpen = ref(false);
 const setupConfig = ref<ServerConfigResponse | null>(null);
+const selectedServerId = ref<string | null>(null);
+const isCreatingServer = ref(false);
 const setupLoading = ref(false);
 const setupError = ref("");
 const setupSuccess = ref("");
@@ -77,6 +85,7 @@ const runtimeLogs = ref<RuntimeLogEvent[]>([]);
 const activeTab = ref<"setup" | "collections">("setup");
 const isClearLogsConfirmOpen = ref(false);
 const isExportLogsConfirmOpen = ref(false);
+const isDeleteServerConfirmOpen = ref(false);
 const showRuntimeLogs = ref(true);
 const lastCollectionChange = ref<CollectionChangeEvent | null>(null);
 const collectionChangeVersion = ref(0);
@@ -92,6 +101,13 @@ const emptyServerSetup: ServerSetup = {
   collectionEndpoints: {},
   schemasByCollection: {}
 };
+const availableServers = computed(() => setupConfig.value?.servers ?? []);
+const setupCardInitialSetup = computed<ServerSetup>(() => {
+  if (isCreatingServer.value) {
+    return emptyServerSetup;
+  }
+  return setupConfig.value?.stagedServerSetup ?? setupConfig.value?.runningServerSetup ?? emptyServerSetup;
+});
 
 const dropdownRoot = ref<HTMLElement | null>(null);
 let websocketClient: WebSocket | null = null;
@@ -238,6 +254,20 @@ function formatLogTimestamp(at: string): string {
   return parsed.toLocaleString();
 }
 
+function syncSelectedServerFromConfig(config: ServerConfigResponse | null): void {
+  if (!config) {
+    selectedServerId.value = null;
+    return;
+  }
+
+  if (config.activeServerId) {
+    selectedServerId.value = config.activeServerId;
+    return;
+  }
+
+  selectedServerId.value = config.servers[0]?.serverId ?? null;
+}
+
 async function refreshRuntimeLogs(): Promise<void> {
   try {
     runtimeLogs.value = await getRuntimeLogs();
@@ -304,9 +334,11 @@ function connectWebSocket(): void {
       const payload = JSON.parse(String(event.data)) as {
         type?: string;
         serverId?: string;
+        activeServerId?: unknown;
         status?: string;
         hasStagedConfig?: boolean;
         hasRunningConfig?: boolean;
+        servers?: unknown;
         replicationEndpointTest?: unknown;
         mongoConnectionTest?: unknown;
         message?: string;
@@ -347,9 +379,29 @@ function connectWebSocket(): void {
 
         handleWsStatus({
           serverId: payload.serverId ?? "unknown",
+          activeServerId: typeof payload.activeServerId === "string" ? payload.activeServerId : null,
           status: payload.status ?? "unknown",
           hasStagedConfig: Boolean(payload.hasStagedConfig),
           hasRunningConfig: Boolean(payload.hasRunningConfig),
+          servers: Array.isArray(payload.servers)
+            ? payload.servers
+                .filter((entry): entry is ServerSummary => {
+                  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+                    return false;
+                  }
+                  const cast = entry as Record<string, unknown>;
+                  return (
+                    typeof cast.serverId === "string" &&
+                    typeof cast.serverIdentifier === "string" &&
+                    typeof cast.url === "string" &&
+                    typeof cast.port === "string" &&
+                    typeof cast.collectionCount === "number" &&
+                    typeof cast.updatedAt === "string" &&
+                    typeof cast.isActive === "boolean"
+                  );
+                })
+                .map((entry) => ({ ...entry }))
+            : [],
           replicationEndpointTest,
           mongoConnectionTest
         });
@@ -501,6 +553,7 @@ async function refreshServerConfig(): Promise<void> {
   refreshInFlight = true;
   try {
     setupConfig.value = await getServerConfig();
+    syncSelectedServerFromConfig(setupConfig.value);
     backendUnavailable.value = false;
     setupError.value = "";
   } catch {
@@ -520,6 +573,8 @@ async function openSetupCard(): Promise<void> {
   try {
     const currentConfig = await getServerConfig();
     setupConfig.value = currentConfig;
+    syncSelectedServerFromConfig(currentConfig);
+    isCreatingServer.value = false;
     backendUnavailable.value = false;
     isSetupCardOpen.value = true;
   } catch {
@@ -536,9 +591,15 @@ async function saveSetup(payload: ServerSetup): Promise<void> {
   console.log("[Setup save] staging server config", payload);
 
   try {
-    setupConfig.value = await stageServerConfig(payload);
+    if (isCreatingServer.value || !selectedServerId.value) {
+      setupConfig.value = await createServer(payload);
+    } else {
+      setupConfig.value = await updateServer(selectedServerId.value, payload);
+    }
+    syncSelectedServerFromConfig(setupConfig.value);
     console.log("[Setup save] staged config response", setupConfig.value);
     backendUnavailable.value = false;
+    isCreatingServer.value = false;
     isSetupCardOpen.value = false;
   } catch {
     console.log("[Setup save] failed to stage config");
@@ -574,6 +635,74 @@ function deployStagedConfig(force = false): void {
 
 function shouldShowStatusReport(): boolean {
   return wsStatus.value?.status === "deploying";
+}
+
+async function selectActiveServer(serverId: string): Promise<void> {
+  setupError.value = "";
+  setupSuccess.value = "";
+  setupLoading.value = true;
+  try {
+    setupConfig.value = await selectServer(serverId);
+    syncSelectedServerFromConfig(setupConfig.value);
+    backendUnavailable.value = false;
+    activeTab.value = "setup";
+  } catch {
+    backendUnavailable.value = true;
+    setupError.value = BACKEND_UNREACHABLE_MESSAGE;
+  } finally {
+    setupLoading.value = false;
+  }
+}
+
+function onServerSelectChange(event: Event): void {
+  const target = event.target as HTMLSelectElement | null;
+  const serverId = target?.value?.trim() ?? "";
+  if (!serverId || serverId === selectedServerId.value) {
+    return;
+  }
+  void selectActiveServer(serverId);
+}
+
+function openCreateServer(): void {
+  setupError.value = "";
+  setupSuccess.value = "";
+  isCreatingServer.value = true;
+  isSetupCardOpen.value = true;
+}
+
+function canEditServer(): boolean {
+  return Boolean(selectedServerId.value);
+}
+
+function canDeleteServer(): boolean {
+  return availableServers.value.length > 0 && Boolean(selectedServerId.value);
+}
+
+function openDeleteServerConfirm(): void {
+  if (!canDeleteServer()) {
+    return;
+  }
+  isDeleteServerConfirmOpen.value = true;
+}
+
+function closeDeleteServerConfirm(): void {
+  isDeleteServerConfirmOpen.value = false;
+}
+
+async function confirmDeleteServer(): Promise<void> {
+  const targetServerId = selectedServerId.value;
+  if (!targetServerId) {
+    closeDeleteServerConfirm();
+    return;
+  }
+
+  try {
+    setupConfig.value = await deleteServer(targetServerId);
+    syncSelectedServerFromConfig(setupConfig.value);
+    activeTab.value = "setup";
+  } finally {
+    closeDeleteServerConfirm();
+  }
 }
 
 function formatLogLine(entry: RuntimeLogEvent): string {
@@ -822,7 +951,7 @@ function logout(): void {
         </div>
       </header>
 
-      <div class="mx-auto max-w-6xl px-6 pt-4 pb-10">
+      <div class="mx-[30px] pt-4 pb-10">
         <div class="max-h-[86vh] space-y-5 overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900/60 p-6">
           <h2 class="text-xl font-semibold">Welcome, {{ currentUsername }}</h2>
 
@@ -852,6 +981,46 @@ function logout(): void {
             </button>
           </div>
 
+          <div v-show="activeTab === 'setup'" class="flex flex-wrap items-end gap-3 rounded-lg border border-slate-700 bg-slate-950/50 p-3">
+            <label class="min-w-64 flex-1 text-sm">
+              <span class="mb-1 block text-slate-300">Active Server</span>
+              <select
+                :value="selectedServerId ?? ''"
+                class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-slate-100 outline-none transition focus:border-sky-500"
+                :disabled="setupLoading || availableServers.length === 0"
+                @change="onServerSelectChange"
+              >
+                <option v-if="availableServers.length === 0" value="">No servers configured</option>
+                <option v-for="server in availableServers" :key="server.serverId" :value="server.serverId">
+                  {{ server.serverIdentifier }} ({{ server.url }}:{{ server.port }})
+                </option>
+              </select>
+            </label>
+            <button
+              type="button"
+              class="rounded-lg border border-emerald-500/60 bg-emerald-600/20 px-4 py-2 text-sm font-medium text-emerald-200 transition hover:bg-emerald-600/30"
+              @click="openCreateServer"
+            >
+              Add Server
+            </button>
+            <button
+              type="button"
+              class="rounded-lg border border-emerald-500/60 bg-emerald-600/20 px-4 py-2 text-sm font-medium text-emerald-200 transition hover:bg-emerald-600/30 disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="!canEditServer()"
+              @click="openSetupCard"
+            >
+              Edit Server
+            </button>
+            <button
+              type="button"
+              class="rounded-lg border border-rose-500/60 bg-rose-600/20 px-4 py-2 text-sm font-medium text-rose-200 transition hover:bg-rose-600/30 disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="!canDeleteServer()"
+              @click="openDeleteServerConfirm"
+            >
+              Delete Server
+            </button>
+          </div>
+
           <SetupTab
             v-show="activeTab === 'setup'"
             :setup-loading="setupLoading"
@@ -877,7 +1046,6 @@ function logout(): void {
             :runtime-logs="runtimeLogs"
             :format-log-timestamp="formatLogTimestamp"
             :show-runtime-logs="showRuntimeLogs"
-            @open-setup-card="openSetupCard"
             @open-deploy-confirm="openDeployConfirm"
             @open-stop-confirm="openStopConfirm"
             @start-server="startServer"
@@ -899,8 +1067,9 @@ function logout(): void {
 
       <SetupCard
         v-if="isSetupCardOpen"
-        :initial-setup="setupConfig?.stagedServerSetup ?? setupConfig?.runningServerSetup ?? emptyServerSetup"
-        @close="isSetupCardOpen = false"
+        :initial-setup="setupCardInitialSetup"
+        :persist-schema-changes="!isCreatingServer"
+        @close="isSetupCardOpen = false; isCreatingServer = false"
         @save="saveSetup"
       />
 
@@ -1009,6 +1178,29 @@ function logout(): void {
               @click="confirmExportLogs"
             >
               Export Logs
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="isDeleteServerConfirmOpen" class="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-black/60 px-4 py-4 sm:items-center">
+        <div class="my-auto w-full max-w-md max-h-[calc(100vh-2rem)] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-5 shadow-2xl shadow-black/40">
+          <h3 class="text-lg font-semibold tracking-tight text-slate-100">Delete Server</h3>
+          <p class="mt-2 text-sm text-slate-300">Delete selected server configuration? Running runtime will be stopped first.</p>
+          <div class="mt-5 flex items-center justify-end gap-2">
+            <button
+              type="button"
+              class="rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:bg-slate-800"
+              @click="closeDeleteServerConfirm"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              class="rounded-lg bg-rose-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-rose-500"
+              @click="confirmDeleteServer"
+            >
+              Delete
             </button>
           </div>
         </div>

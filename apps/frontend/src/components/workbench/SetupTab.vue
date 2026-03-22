@@ -43,7 +43,6 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  openSetupCard: [];
   openDeployConfirm: [];
   openStopConfirm: [];
   startServer: [];
@@ -56,14 +55,6 @@ const emit = defineEmits<{
 <template>
   <div class="space-y-5">
     <div class="flex flex-wrap items-center gap-3">
-      <button
-        type="button"
-        class="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:bg-slate-700"
-        :disabled="props.setupLoading"
-        @click="emit('openSetupCard')"
-      >
-        Setup RxDB Server
-      </button>
       <button
         v-if="props.wsStatus?.hasStagedConfig"
         type="button"
@@ -203,7 +194,7 @@ const emit = defineEmits<{
         </div>
       </div>
       <div v-if="props.showRuntimeLogs && props.runtimeLogs.length === 0" class="terminal-empty mt-2">No logs yet.</div>
-      <div v-else-if="props.showRuntimeLogs" class="terminal-log-panel thin-scrollbar mt-2 max-h-64 overflow-y-auto p-3">
+      <div v-else-if="props.showRuntimeLogs" class="terminal-log-panel thin-scrollbar mt-2 max-h-[12.8rem] overflow-y-auto p-3">
         <div v-for="(entry, index) in props.runtimeLogs" :key="`${entry.at}-${index}`" class="terminal-log-entry">
           <p class="terminal-log-meta">{{ props.formatLogTimestamp(entry.at) }}</p>
           <p class="terminal-log-meta">{{ entry.area }} | {{ entry.level }}</p>

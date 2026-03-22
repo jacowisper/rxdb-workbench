@@ -57,6 +57,7 @@ const removeDocsError = ref("");
 const unfilteredCollectionCount = ref<number | null>(null);
 const currentPage = ref(1);
 const pageSize = 100;
+const selectedColumns = ref(1);
 const markedDeleteDocKeys = ref<Set<string>>(new Set());
 const editDocEditorHost = ref<HTMLDivElement | null>(null);
 let collectionChangeRefreshTimer: number | null = null;
@@ -413,6 +414,15 @@ async function applyDocEdit(): Promise<void> {
 }
 
 const selectedDeleteCount = computed(() => markedDeleteDocKeys.value.size);
+const documentsGridClass = computed(() => {
+  if (selectedColumns.value === 2) {
+    return "grid grid-cols-1 gap-2 lg:grid-cols-2";
+  }
+  if (selectedColumns.value === 3) {
+    return "grid grid-cols-1 gap-2 lg:grid-cols-3";
+  }
+  return "grid grid-cols-1 gap-2";
+});
 
 function openApplyDeleteConfirm(): void {
   if (selectedDeleteCount.value <= 0) {
@@ -851,6 +861,17 @@ onBeforeUnmount(() => {
           <Check class="h-3.5 w-3.5" aria-hidden="true" />
           <span>APPLY</span>
         </button>
+        <label class="inline-flex items-center gap-2 rounded-lg border border-slate-600 bg-slate-800/50 px-2 py-1.5 text-xs font-medium text-slate-200">
+          <span>Columns</span>
+          <select
+            v-model.number="selectedColumns"
+            class="rounded border border-slate-600 bg-slate-900 px-1.5 py-0.5 text-xs text-slate-200 focus:border-sky-500 focus:outline-none"
+          >
+            <option :value="1">1</option>
+            <option :value="2">2</option>
+            <option :value="3">3</option>
+          </select>
+        </label>
         <div class="ml-auto inline-flex items-center gap-1 text-xs text-slate-300">
           <button
             type="button"
@@ -879,43 +900,44 @@ onBeforeUnmount(() => {
         <p v-if="!selectedCollection" class="text-sm text-slate-400">Select a collection to view documents.</p>
         <p v-else-if="collectionDocs.length === 0 && isResyncing" class="text-sm text-amber-300">Waiting on resync</p>
         <p v-else-if="collectionDocs.length === 0" class="text-sm text-slate-400">No documents found.</p>
-
-        <div
-          v-for="(doc, docIndex) in collectionDocs"
-          :key="`doc-${docIndex}`"
-          class="relative rounded-lg border border-slate-700 bg-slate-950 px-3 pt-2 pb-3 font-mono text-xs text-slate-200"
-        >
-          <div class="absolute right-2 top-2 z-10 flex items-center gap-2">
-            <button
-              type="button"
-              class="inline-flex items-center gap-1 rounded border border-slate-600 bg-slate-900/90 px-2 py-1 text-[11px] font-medium text-slate-200 transition hover:bg-slate-700/90"
-              @click="openDocEditModal(docIndex)"
-            >
-              <Pencil class="h-3 w-3" aria-hidden="true" />
-              <span>Edit</span>
-            </button>
-            <button
-              type="button"
-              class="inline-flex items-center gap-1 rounded border px-2 py-1 text-[11px] font-medium transition"
-              :class="
-                isDocMarkedForDelete(docIndex)
-                  ? 'border-amber-500 bg-amber-600/40 text-amber-200 hover:bg-amber-600/50'
-                  : 'border-slate-600 bg-slate-900/90 text-slate-200 hover:bg-slate-700/90'
-              "
-              @click="toggleDocMarkedForDelete(docIndex)"
-            >
-              <Trash2 class="h-3 w-3" aria-hidden="true" />
-              <span>Delete</span>
-            </button>
+        <div v-else :class="documentsGridClass">
+          <div
+            v-for="(doc, docIndex) in collectionDocs"
+            :key="`doc-${docIndex}`"
+            class="relative rounded-lg border border-slate-700 bg-slate-950 px-3 pt-2 pb-3 font-mono text-xs text-slate-200"
+          >
+            <div class="absolute right-2 top-2 z-10 flex items-center gap-2">
+              <button
+                type="button"
+                class="inline-flex items-center gap-1 rounded border border-slate-600 bg-slate-900/90 px-2 py-1 text-[11px] font-medium text-slate-200 transition hover:bg-slate-700/90"
+                @click="openDocEditModal(docIndex)"
+              >
+                <Pencil class="h-3 w-3" aria-hidden="true" />
+                <span>Edit</span>
+              </button>
+              <button
+                type="button"
+                class="inline-flex items-center gap-1 rounded border px-2 py-1 text-[11px] font-medium transition"
+                :class="
+                  isDocMarkedForDelete(docIndex)
+                    ? 'border-amber-500 bg-amber-600/40 text-amber-200 hover:bg-amber-600/50'
+                    : 'border-slate-600 bg-slate-900/90 text-slate-200 hover:bg-slate-700/90'
+                "
+                @click="toggleDocMarkedForDelete(docIndex)"
+              >
+                <Trash2 class="h-3 w-3" aria-hidden="true" />
+                <span>Delete</span>
+              </button>
+            </div>
+            <JsonTreeNode
+              v-for="(value, key) in doc"
+              :key="`${docIndex}-${String(key)}`"
+              :label="String(key)"
+              :value="value"
+              :depth="0"
+              @select-leaf-key="fillQueryFromKeyPath"
+            />
           </div>
-          <JsonTreeNode
-            v-for="(value, key) in doc"
-            :key="`${docIndex}-${String(key)}`"
-            :label="String(key)"
-            :value="value"
-            :depth="0"
-            @select-leaf-key="fillQueryFromKeyPath"
-          />
         </div>
       </div>
     </div>

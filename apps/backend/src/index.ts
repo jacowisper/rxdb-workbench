@@ -72,6 +72,14 @@ type RuntimeStatus = "stopped" | "running" | "deploying" | "staged";
 type BackendConfig = {
   runningServerSetup: ServerSetup | null;
   stagedServerSetup: ServerSetup | null;
+  activeServerId: string | null;
+  serverCatalog: Record<
+    string,
+    {
+      setup: ServerSetup;
+      updatedAt: string;
+    }
+  >;
   replicationEndpointTest: ReplicationEndpointTestResult | null;
   mongoConnectionTest: MongoConnectionTestResult | null;
   settings: SettingsStore;
@@ -92,6 +100,16 @@ type ClientCommand =
   | { type: "server:deploy-staged-config"; force: boolean }
   | { type: "server:stop-server" }
   | { type: "server:start-server" };
+
+type ServerSummary = {
+  serverId: string;
+  serverIdentifier: string;
+  url: string;
+  port: string;
+  collectionCount: number;
+  updatedAt: string;
+  isActive: boolean;
+};
 
 const backendConfigFilePath = process.env.BACKEND_CONFIG_FILE
   ? path.resolve(process.cwd(), process.env.BACKEND_CONFIG_FILE)
@@ -122,6 +140,8 @@ function getDefaultBackendConfig(): BackendConfig {
   return {
     runningServerSetup: null,
     stagedServerSetup: null,
+    activeServerId: null,
+    serverCatalog: {},
     replicationEndpointTest: null,
     mongoConnectionTest: null,
     settings: {},
@@ -197,6 +217,105 @@ function normalizeNullableServerSetup(input: unknown): ServerSetup | null {
   return hasValue ? normalized : null;
 }
 
+function cloneServerSetup(setup: ServerSetup): ServerSetup {
+  return JSON.parse(JSON.stringify(setup)) as ServerSetup;
+}
+
+function normalizeServerCatalog(input: unknown): BackendConfig["serverCatalog"] {
+  if (!isPlainObject(input)) {
+    return {};
+  }
+
+  const normalizedEntries = Object.entries(input)
+    .filter(([serverId, value]) => typeof serverId === "string" && isPlainObject(value))
+    .map(([serverId, value]) => {
+      const entry = value as Record<string, unknown>;
+      const setup = normalizeNullableServerSetup(entry.setup);
+      if (!isValidServerSetup(setup)) {
+        return null;
+      }
+
+      const updatedAt = typeof entry.updatedAt === "string" && entry.updatedAt.trim() ? entry.updatedAt : new Date().toISOString();
+      return [serverId, { setup, updatedAt }] as const;
+    })
+    .filter((entry): entry is readonly [string, { setup: ServerSetup; updatedAt: string }] => entry !== null);
+
+  return Object.fromEntries(normalizedEntries);
+}
+
+function normalizeServerKey(input: string): string {
+  const normalized = input
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9_-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized || "rxdb-server";
+}
+
+function createServerId(serverIdentifier: string, catalog: BackendConfig["serverCatalog"]): string {
+  const base = normalizeServerKey(serverIdentifier);
+  if (!catalog[base]) {
+    return base;
+  }
+
+  let suffix = 2;
+  while (catalog[`${base}-${suffix}`]) {
+    suffix += 1;
+  }
+  return `${base}-${suffix}`;
+}
+
+function getServerSummaries(config: BackendConfig): ServerSummary[] {
+  return Object.entries(config.serverCatalog)
+    .map(([serverId, value]) => ({
+      serverId,
+      serverIdentifier: value.setup.serverIdentifier,
+      url: value.setup.url,
+      port: value.setup.port,
+      collectionCount: value.setup.collections.length,
+      updatedAt: value.updatedAt,
+      isActive: config.activeServerId === serverId
+    }))
+    .sort((a, b) => a.serverIdentifier.localeCompare(b.serverIdentifier));
+}
+
+function saveActiveSetupToCatalog(config: BackendConfig): void {
+  const candidate = config.stagedServerSetup ?? config.runningServerSetup;
+  if (!isValidServerSetup(candidate)) {
+    return;
+  }
+
+  let activeServerId = config.activeServerId;
+  if (!activeServerId) {
+    activeServerId = createServerId(candidate.serverIdentifier, config.serverCatalog);
+    config.activeServerId = activeServerId;
+    config.runtime.serverId = activeServerId;
+  }
+
+  config.serverCatalog[activeServerId] = {
+    setup: cloneServerSetup(candidate),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function setActiveServer(config: BackendConfig, serverId: string): boolean {
+  const entry = config.serverCatalog[serverId];
+  if (!entry || !isValidServerSetup(entry.setup)) {
+    return false;
+  }
+
+  config.activeServerId = serverId;
+  config.runtime.serverId = serverId;
+  config.runningServerSetup = null;
+  config.stagedServerSetup = cloneServerSetup(entry.setup);
+  config.replicationEndpointTest = null;
+  config.mongoConnectionTest = null;
+  config.runtime.status = "staged";
+  return true;
+}
+
 function migrateLocalhostMongoConnectionString(setup: ServerSetup | null): ServerSetup | null {
   if (!setup) {
     return null;
@@ -218,8 +337,19 @@ function migrateLocalhostMongoConnectionString(setup: ServerSetup | null): Serve
 }
 
 function migrateBackendConfig(config: BackendConfig): BackendConfig {
+  const migratedCatalog = Object.fromEntries(
+    Object.entries(config.serverCatalog).map(([serverId, value]) => [
+      serverId,
+      {
+        ...value,
+        setup: migrateLocalhostMongoConnectionString(value.setup) ?? value.setup
+      }
+    ])
+  );
+
   return {
     ...config,
+    serverCatalog: migratedCatalog,
     runningServerSetup: migrateLocalhostMongoConnectionString(config.runningServerSetup),
     stagedServerSetup: migrateLocalhostMongoConnectionString(config.stagedServerSetup)
   };
@@ -270,17 +400,47 @@ function normalizeBackendConfig(input: unknown): BackendConfig {
           error: mongoConnectionTest.error
         }
       : null;
+  const serverCatalog = normalizeServerCatalog(input.serverCatalog);
+  const activeServerId =
+    typeof input.activeServerId === "string" && input.activeServerId.trim() && serverCatalog[input.activeServerId]
+      ? input.activeServerId
+      : null;
+
+  let runningServerSetup = normalizeNullableServerSetup(input.runningServerSetup);
+  let stagedServerSetup = normalizeNullableServerSetup(input.stagedServerSetup);
+  let resolvedActiveServerId = activeServerId;
+
+  if (!resolvedActiveServerId) {
+    const firstCatalogServerId = Object.keys(serverCatalog)[0] ?? null;
+    if (firstCatalogServerId) {
+      resolvedActiveServerId = firstCatalogServerId;
+      stagedServerSetup = cloneServerSetup(serverCatalog[firstCatalogServerId].setup);
+      runningServerSetup = null;
+    } else {
+      const legacySetup = stagedServerSetup ?? runningServerSetup;
+      if (isValidServerSetup(legacySetup)) {
+        const serverId = createServerId(legacySetup.serverIdentifier, serverCatalog);
+        serverCatalog[serverId] = {
+          setup: cloneServerSetup(legacySetup),
+          updatedAt: new Date().toISOString()
+        };
+        resolvedActiveServerId = serverId;
+      }
+    }
+  }
 
   return {
-    runningServerSetup: normalizeNullableServerSetup(input.runningServerSetup),
-    stagedServerSetup: normalizeNullableServerSetup(input.stagedServerSetup),
+    runningServerSetup,
+    stagedServerSetup,
+    activeServerId: resolvedActiveServerId,
+    serverCatalog,
     replicationEndpointTest: replicationEndpointTestNormalized,
     mongoConnectionTest: mongoConnectionTestNormalized,
     settings: isPlainObject(input.settings) ? input.settings : {},
-      runtime: {
-        serverId: typeof runtime.serverId === "string" ? runtime.serverId : "rxdb-server-1",
-        status: status === "running" || status === "deploying" || status === "stopped" || status === "staged" ? status : "stopped"
-      }
+    runtime: {
+      serverId: typeof runtime.serverId === "string" && runtime.serverId.trim() ? runtime.serverId : resolvedActiveServerId ?? "rxdb-server-1",
+      status: status === "running" || status === "deploying" || status === "stopped" || status === "staged" ? status : "stopped"
+    }
   };
 }
 
@@ -316,6 +476,29 @@ function resolveStartupWebSocketPort(): number {
 
 function getEffectiveServerSetup(config: BackendConfig): ServerSetup | null {
   return config.stagedServerSetup ?? config.runningServerSetup;
+}
+
+function ensureActiveServerMaterialized(config: BackendConfig): void {
+  if (config.activeServerId && config.serverCatalog[config.activeServerId]) {
+    if (!config.runtime.serverId.trim()) {
+      config.runtime.serverId = config.activeServerId;
+    }
+    return;
+  }
+
+  const firstServerId = Object.keys(config.serverCatalog)[0] ?? null;
+  if (!firstServerId) {
+    config.activeServerId = null;
+    config.runtime.serverId = "rxdb-server-1";
+    config.runningServerSetup = null;
+    config.stagedServerSetup = null;
+    config.replicationEndpointTest = null;
+    config.mongoConnectionTest = null;
+    config.runtime.status = "stopped";
+    return;
+  }
+
+  setActiveServer(config, firstServerId);
 }
 
 function deriveDefaultReplEndpoint(collectionName: string): string {
@@ -408,6 +591,8 @@ async function testCollectionReplicationEndpoint(setup: ServerSetup, collection:
 }
 
 let backendConfig = loadBackendConfig();
+ensureActiveServerMaterialized(backendConfig);
+persistBackendConfig(backendConfig);
 let replicationEndpointTestRunId = 0;
 let collectionResetRunId = 0;
 const runtimeLogBuffer: RuntimeLogEvent[] = [];
@@ -531,8 +716,9 @@ function normalizeServerIdentifierForMongo(serverIdentifier: string): string {
   return normalized || "rxdb-runtime";
 }
 
-function deriveMongoRuntimeDatabaseName(setup: ServerSetup): string {
-  return `rxdb-workbench-${normalizeServerIdentifierForMongo(setup.serverIdentifier)}-v0`;
+function deriveMongoRuntimeDatabaseName(setup: ServerSetup, scopeKey?: string): string {
+  const databaseScope = scopeKey?.trim() ? scopeKey : setup.serverIdentifier;
+  return `rxdb-workbench-${normalizeServerIdentifierForMongo(databaseScope)}-v0`;
 }
 
 function getRemovedCollections(previousSetup: ServerSetup | null, nextSetup: ServerSetup): string[] {
@@ -563,7 +749,7 @@ async function cleanupRemovedCollectionsInMongo(previousSetup: ServerSetup, remo
     return;
   }
 
-  const runtimeDbName = deriveMongoRuntimeDatabaseName(previousSetup);
+  const runtimeDbName = deriveMongoRuntimeDatabaseName(previousSetup, backendConfig.activeServerId ?? undefined);
   const client = new MongoClient(previousSetup.mongodbConnectionString.trim(), {
     serverSelectionTimeoutMS: 10000
   });
@@ -657,41 +843,14 @@ async function cleanupRemovedCollectionsInMongo(previousSetup: ServerSetup, remo
   }
 }
 
-async function dropRuntimeDatabaseForSetup(previousSetup: ServerSetup): Promise<void> {
-  const runtimeDbName = deriveMongoRuntimeDatabaseName(previousSetup);
-  const client = new MongoClient(previousSetup.mongodbConnectionString.trim(), {
-    serverSelectionTimeoutMS: 10000
-  });
-
-  emitRuntimeLog({
-    at: new Date().toISOString(),
-    level: "warn",
-    area: "mongo",
-    message: `Dropping previous runtime database "${runtimeDbName}" due to server name change.`
-  });
-
-  try {
-    await client.connect();
-    await client.db(runtimeDbName).dropDatabase();
-  } finally {
-    await client.close().catch(() => undefined);
-  }
-}
-
 async function applyRunningSetup(setup: ServerSetup, previousSetup: ServerSetup | null = backendConfig.runningServerSetup): Promise<void> {
   const removedCollections = getRemovedCollections(previousSetup, setup);
   const previousValidSetup = isValidServerSetup(previousSetup);
-  const serverNameChanged =
-    previousValidSetup &&
-    deriveMongoRuntimeDatabaseName(previousSetup) !== deriveMongoRuntimeDatabaseName(setup);
 
-  if (removedCollections.length > 0 || serverNameChanged) {
+  if (removedCollections.length > 0) {
     await runtimeController.stop();
     if (previousValidSetup) {
       await cleanupRemovedCollectionsInMongo(previousSetup, removedCollections);
-      if (serverNameChanged) {
-        await dropRuntimeDatabaseForSetup(previousSetup);
-      }
     }
     await runtimeController.start(setup);
     return;
@@ -756,6 +915,7 @@ function triggerHardResetCollection(collection: string): void {
       await runtimeController.start(setup);
       backendConfig.runningServerSetup = setup;
       backendConfig.runtime.status = "running";
+      saveActiveSetupToCatalog(backendConfig);
       persistBackendConfig(backendConfig);
       broadcastServerStatus();
       emitRuntimeLog({
@@ -777,6 +937,18 @@ function triggerHardResetCollection(collection: string): void {
       });
     }
   })();
+}
+
+function buildServerConfigResponse() {
+  return {
+    runningServerSetup: backendConfig.runningServerSetup,
+    stagedServerSetup: backendConfig.stagedServerSetup,
+    replicationEndpointTest: backendConfig.replicationEndpointTest,
+    mongoConnectionTest: backendConfig.mongoConnectionTest,
+    effectiveServerSetup: getEffectiveServerSetup(backendConfig),
+    activeServerId: backendConfig.activeServerId,
+    servers: getServerSummaries(backendConfig)
+  };
 }
 
 app.use(cors());
@@ -807,9 +979,7 @@ app.post("/api/settings/get", (req, res) => {
   if (!key) {
     return res.json({
       settings: backendConfig.settings,
-      runningServerSetup: backendConfig.runningServerSetup,
-      stagedServerSetup: backendConfig.stagedServerSetup,
-      effectiveServerSetup: getEffectiveServerSetup(backendConfig)
+      ...buildServerConfigResponse()
     });
   }
 
@@ -851,13 +1021,160 @@ app.post("/api/settings/update", (req, res) => {
 });
 
 app.post("/api/server/config/get", (_req, res) => {
+  return res.json(buildServerConfigResponse());
+});
+
+app.post("/api/server/list", (_req, res) => {
   return res.json({
-    runningServerSetup: backendConfig.runningServerSetup,
-    stagedServerSetup: backendConfig.stagedServerSetup,
-    replicationEndpointTest: backendConfig.replicationEndpointTest,
-    mongoConnectionTest: backendConfig.mongoConnectionTest,
-    effectiveServerSetup: getEffectiveServerSetup(backendConfig)
+    ok: true,
+    activeServerId: backendConfig.activeServerId,
+    servers: getServerSummaries(backendConfig)
   });
+});
+
+app.post("/api/server/select", async (req, res) => {
+  const body = req.body as { serverId?: unknown };
+  const serverId = typeof body.serverId === "string" ? body.serverId.trim() : "";
+  if (!serverId) {
+    return res.status(400).json({ error: "Invalid payload. Expected serverId." });
+  }
+
+  if (!backendConfig.serverCatalog[serverId]) {
+    return res.status(404).json({ error: "Server not found." });
+  }
+
+  try {
+    if (runtimeController.getState() === "running") {
+      await runtimeController.stop();
+    }
+    if (!setActiveServer(backendConfig, serverId)) {
+      return res.status(404).json({ error: "Server not found." });
+    }
+    persistBackendConfig(backendConfig);
+    broadcastServerStatus();
+    return res.json({
+      ok: true,
+      ...buildServerConfigResponse()
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : "Failed to select server." });
+  }
+});
+
+app.post("/api/server/create", (req, res) => {
+  const body = req.body as { serverSetup?: unknown };
+  if (body.serverSetup === undefined) {
+    return res.status(400).json({ error: "Invalid payload. Expected serverSetup." });
+  }
+
+  const normalized = normalizeNullableServerSetup(body.serverSetup);
+  if (!isValidServerSetup(normalized)) {
+    return res.status(400).json({ error: "Invalid serverSetup. Missing required fields." });
+  }
+
+  const serverId = createServerId(normalized.serverIdentifier, backendConfig.serverCatalog);
+  backendConfig.serverCatalog[serverId] = {
+    setup: cloneServerSetup(normalized),
+    updatedAt: new Date().toISOString()
+  };
+  setActiveServer(backendConfig, serverId);
+  scheduleReplicationEndpointTest(normalized);
+
+  try {
+    persistBackendConfig(backendConfig);
+  } catch {
+    return res.status(500).json({ error: "Failed to persist server config." });
+  }
+
+  broadcastServerStatus();
+  return res.json({
+    ok: true,
+    serverId,
+    ...buildServerConfigResponse()
+  });
+});
+
+app.post("/api/server/update", (req, res) => {
+  const body = req.body as { serverId?: unknown; serverSetup?: unknown };
+  const serverId = typeof body.serverId === "string" ? body.serverId.trim() : "";
+  if (!serverId) {
+    return res.status(400).json({ error: "Invalid payload. Expected serverId." });
+  }
+  if (!backendConfig.serverCatalog[serverId]) {
+    return res.status(404).json({ error: "Server not found." });
+  }
+
+  const normalized = normalizeNullableServerSetup(body.serverSetup);
+  if (!isValidServerSetup(normalized)) {
+    return res.status(400).json({ error: "Invalid serverSetup. Missing required fields." });
+  }
+
+  backendConfig.serverCatalog[serverId] = {
+    setup: cloneServerSetup(normalized),
+    updatedAt: new Date().toISOString()
+  };
+
+  if (backendConfig.activeServerId === serverId) {
+    backendConfig.stagedServerSetup = cloneServerSetup(normalized);
+    backendConfig.runtime.status = "staged";
+    backendConfig.replicationEndpointTest = null;
+    backendConfig.mongoConnectionTest = null;
+    scheduleReplicationEndpointTest(normalized);
+  }
+
+  try {
+    persistBackendConfig(backendConfig);
+  } catch {
+    return res.status(500).json({ error: "Failed to persist server config." });
+  }
+
+  broadcastServerStatus();
+  return res.json({
+    ok: true,
+    ...buildServerConfigResponse()
+  });
+});
+
+app.post("/api/server/delete", async (req, res) => {
+  const body = req.body as { serverId?: unknown };
+  const serverId = typeof body.serverId === "string" ? body.serverId.trim() : "";
+  if (!serverId) {
+    return res.status(400).json({ error: "Invalid payload. Expected serverId." });
+  }
+
+  if (!backendConfig.serverCatalog[serverId]) {
+    return res.status(404).json({ error: "Server not found." });
+  }
+
+  try {
+    if (backendConfig.activeServerId === serverId && runtimeController.getState() === "running") {
+      await runtimeController.stop();
+    }
+
+    delete backendConfig.serverCatalog[serverId];
+    backendConfig.replicationEndpointTest = null;
+    backendConfig.mongoConnectionTest = null;
+
+    const nextServerId = Object.keys(backendConfig.serverCatalog)[0] ?? null;
+    if (nextServerId) {
+      setActiveServer(backendConfig, nextServerId);
+    } else {
+      backendConfig.activeServerId = null;
+      backendConfig.runtime.serverId = "rxdb-server-1";
+      backendConfig.runningServerSetup = null;
+      backendConfig.stagedServerSetup = null;
+      backendConfig.runtime.status = "stopped";
+    }
+
+    persistBackendConfig(backendConfig);
+    broadcastServerStatus();
+    return res.json({
+      ok: true,
+      ...buildServerConfigResponse()
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : "Failed to delete server." });
+  }
 });
 
 app.post("/api/server/config/stage", (req, res) => {
@@ -876,6 +1193,7 @@ app.post("/api/server/config/stage", (req, res) => {
   backendConfig.runtime.status = "staged";
   backendConfig.replicationEndpointTest = null;
   backendConfig.mongoConnectionTest = null;
+  saveActiveSetupToCatalog(backendConfig);
   scheduleReplicationEndpointTest(normalized);
 
   try {
@@ -886,14 +1204,7 @@ app.post("/api/server/config/stage", (req, res) => {
 
   broadcastServerStatus();
 
-  return res.json({
-    ok: true,
-    runningServerSetup: backendConfig.runningServerSetup,
-    stagedServerSetup: backendConfig.stagedServerSetup,
-    replicationEndpointTest: backendConfig.replicationEndpointTest,
-    mongoConnectionTest: backendConfig.mongoConnectionTest,
-    effectiveServerSetup: getEffectiveServerSetup(backendConfig)
-  });
+  return res.json({ ok: true, ...buildServerConfigResponse() });
 });
 
 app.post("/api/server/config/update", (req, res) => {
@@ -912,6 +1223,7 @@ app.post("/api/server/config/update", (req, res) => {
   backendConfig.runtime.status = "staged";
   backendConfig.replicationEndpointTest = null;
   backendConfig.mongoConnectionTest = null;
+  saveActiveSetupToCatalog(backendConfig);
   scheduleReplicationEndpointTest(normalized);
 
   try {
@@ -922,14 +1234,7 @@ app.post("/api/server/config/update", (req, res) => {
 
   broadcastServerStatus();
 
-  return res.json({
-    ok: true,
-    runningServerSetup: backendConfig.runningServerSetup,
-    stagedServerSetup: backendConfig.stagedServerSetup,
-    replicationEndpointTest: backendConfig.replicationEndpointTest,
-    mongoConnectionTest: backendConfig.mongoConnectionTest,
-    effectiveServerSetup: getEffectiveServerSetup(backendConfig)
-  });
+  return res.json({ ok: true, ...buildServerConfigResponse() });
 });
 
 app.post("/api/server/deploy/validate", async (_req, res) => {
@@ -986,6 +1291,7 @@ app.post("/api/server/schema/upsert", (req, res) => {
   }
 
   backendConfig.stagedServerSetup = targetSetup;
+  saveActiveSetupToCatalog(backendConfig);
 
   try {
     persistBackendConfig(backendConfig);
@@ -1019,6 +1325,7 @@ app.post("/api/server/schema/remove", (req, res) => {
   delete targetSetup.schemasByCollection[collection];
 
   backendConfig.stagedServerSetup = targetSetup;
+  saveActiveSetupToCatalog(backendConfig);
 
   try {
     persistBackendConfig(backendConfig);
@@ -1300,9 +1607,11 @@ function buildServerStatusMessage() {
   return {
     type: "server:status",
     serverId: backendConfig.runtime.serverId,
+    activeServerId: backendConfig.activeServerId,
     status: backendConfig.runtime.status,
     hasStagedConfig: backendConfig.stagedServerSetup !== null,
     hasRunningConfig: backendConfig.runningServerSetup !== null,
+    servers: getServerSummaries(backendConfig),
     replicationEndpointTest: backendConfig.replicationEndpointTest,
     mongoConnectionTest: backendConfig.mongoConnectionTest
   };
@@ -1393,6 +1702,7 @@ websocketServer.on("connection", (socket: WebSocket, request: IncomingMessage) =
             backendConfig.runningServerSetup = stagedSetup;
             backendConfig.stagedServerSetup = null;
             backendConfig.runtime.status = "running";
+            saveActiveSetupToCatalog(backendConfig);
             persistBackendConfig(backendConfig);
             sendJson(socket, {
               type: "server:deployed",
@@ -1457,6 +1767,7 @@ websocketServer.on("connection", (socket: WebSocket, request: IncomingMessage) =
           backendConfig.runningServerSetup = stagedSetup;
           backendConfig.stagedServerSetup = null;
           backendConfig.runtime.status = "running";
+          saveActiveSetupToCatalog(backendConfig);
           persistBackendConfig(backendConfig);
         } catch {
           backendConfig.runtime.status = "staged";
@@ -1509,6 +1820,7 @@ websocketServer.on("connection", (socket: WebSocket, request: IncomingMessage) =
           await applyRunningSetup(effectiveSetup, backendConfig.runningServerSetup);
           backendConfig.runningServerSetup = effectiveSetup;
           backendConfig.runtime.status = "running";
+          saveActiveSetupToCatalog(backendConfig);
           persistBackendConfig(backendConfig);
           sendJson(socket, {
             type: "server:started",

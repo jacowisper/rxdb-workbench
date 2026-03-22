@@ -9,6 +9,7 @@ import { removeServerSchema, stageServerConfig, upsertServerSchema, type ServerS
 
 const props = defineProps<{
   initialSetup: ServerSetup;
+  persistSchemaChanges?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -427,6 +428,10 @@ async function ensureSetupStagedForSchemaActions(validateLocally = true): Promis
     return false;
   }
 
+  if (props.persistSchemaChanges === false) {
+    return true;
+  }
+
   try {
     await stageServerConfig(buildPayload());
     return true;
@@ -467,7 +472,9 @@ async function uploadSchema(event: Event): Promise<void> {
     const parsed = JSON.parse(text) as unknown;
 
     try {
-      await upsertServerSchema(target, parsed);
+      if (props.persistSchemaChanges !== false) {
+        await upsertServerSchema(target, parsed);
+      }
       schemasByCollection.value[target] = parsed;
       syncSchemaValidationState();
     } catch (error) {
@@ -715,7 +722,9 @@ async function removeSchema(): Promise<void> {
   isPasteSchemaModalOpen.value = false;
 
   try {
-    await removeServerSchema(target);
+    if (props.persistSchemaChanges !== false) {
+      await removeServerSchema(target);
+    }
   } catch (error) {
     // Keep local remove behavior. Ignore backend setup-state errors for unsaved setups.
     const message = getApiErrorMessage(error, "Schema remove failed. Unable to contact backend service is it running ?");
