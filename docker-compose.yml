@@ -1,0 +1,52 @@
+services:
+  mongodb:
+    image: mongodb/mongodb-community-server:latest
+    container_name: modest_shirley
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: "${MONGO_INITDB_ROOT_USERNAME:-rxdbadmin}"
+      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_INITDB_ROOT_PASSWORD:-rxdbpass}"
+      MONGO_INITDB_DATABASE: "${MONGO_INITDB_DATABASE:-rxdb-workbench}"
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+
+  backend:
+    container_name: rxdb-workbench-backend
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    env_file:
+      - .env
+    environment:
+      BACKEND_PORT: "${BACKEND_PORT:-4000}"
+      BACKEND_DEFAULT_WEBSOCKET_PORT: "${BACKEND_DEFAULT_WEBSOCKET_PORT:-4001}"
+      BACKEND_DEFAULT_MONGODB_CONNECTION_STRING: "${BACKEND_DEFAULT_MONGODB_CONNECTION_STRING:-mongodb://rxdbadmin:rxdbpass@mongodb:27017/rxdb-workbench?authSource=admin}"
+    ports:
+      - "${BACKEND_PORT:-4000}:${BACKEND_PORT:-4000}"
+      - "${BACKEND_DEFAULT_WEBSOCKET_PORT:-4001}:${BACKEND_DEFAULT_WEBSOCKET_PORT:-4001}"
+    volumes:
+      - backend-data:/app/apps/backend/data
+    restart: unless-stopped
+
+  frontend:
+    container_name: rxdb-workbench-frontend
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+      args:
+        VITE_FRONTEND_TO_USE_FORBACKEND_TOKEN: "${VITE_FRONTEND_TO_USE_FORBACKEND_TOKEN:-85533878a62652c01f764ba4d7e154ddaf6e7}"
+        VITE_FRONTEND_TO_USE_BACKEND_URL: "${VITE_FRONTEND_TO_USE_BACKEND_URL:-http://localhost:4000}"
+        VITE_FRONTEND_TO_USE_BACKEND_WEBSOCKET_PORT: "${VITE_FRONTEND_TO_USE_BACKEND_WEBSOCKET_PORT:-4001}"
+        VITE_FRONTEND_DEFAULT_MONGODB_CONNECTION_STRING: "${VITE_FRONTEND_DEFAULT_MONGODB_CONNECTION_STRING:-mongodb://rxdbadmin:rxdbpass@mongodb:27017/rxdb-workbench?authSource=admin}"
+    depends_on:
+      - mongodb
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    restart: unless-stopped
+
+volumes:
+  backend-data:
+  mongo-data:

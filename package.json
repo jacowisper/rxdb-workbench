@@ -1,0 +1,16 @@
+{
+  "name": "rxdb-server-workbench",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace apps/backend",
+    "dev:backend": "npm run dev --workspace apps/backend",
+    "dev:frontend": "npm run dev --workspace apps/frontend",
+    "build": "npm run build --workspaces",
+    "build:backend": "npm run build --workspace apps/backend",
+    "build:frontend": "npm run build --workspace apps/frontend"
+  }
+}

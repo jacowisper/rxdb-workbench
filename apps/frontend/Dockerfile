@@ -1,0 +1,26 @@
+FROM node:20-alpine AS build
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+COPY tsconfig.base.json ./
+COPY apps/frontend/package.json apps/frontend/package.json
+RUN npm ci --workspace apps/frontend --include-workspace-root=false
+
+COPY apps/frontend apps/frontend
+
+ARG VITE_FRONTEND_TO_USE_FORBACKEND_TOKEN
+ARG VITE_FRONTEND_TO_USE_BACKEND_URL
+ARG VITE_FRONTEND_TO_USE_BACKEND_WEBSOCKET_PORT
+ARG VITE_FRONTEND_DEFAULT_MONGODB_CONNECTION_STRING
+
+ENV VITE_FRONTEND_TO_USE_FORBACKEND_TOKEN=${VITE_FRONTEND_TO_USE_FORBACKEND_TOKEN}
+ENV VITE_FRONTEND_TO_USE_BACKEND_URL=${VITE_FRONTEND_TO_USE_BACKEND_URL}
+ENV VITE_FRONTEND_TO_USE_BACKEND_WEBSOCKET_PORT=${VITE_FRONTEND_TO_USE_BACKEND_WEBSOCKET_PORT}
+ENV VITE_FRONTEND_DEFAULT_MONGODB_CONNECTION_STRING=${VITE_FRONTEND_DEFAULT_MONGODB_CONNECTION_STRING}
+
+RUN npm run build --workspace apps/frontend
+
+FROM nginx:1.27-alpine AS runtime
+COPY apps/frontend/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/apps/frontend/dist /usr/share/nginx/html
+EXPOSE 80
