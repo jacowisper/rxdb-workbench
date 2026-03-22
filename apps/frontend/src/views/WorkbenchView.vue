@@ -913,7 +913,7 @@ function logout(): void {
   <main class="min-h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-800 text-slate-100">
     <section class="min-h-screen">
       <header class="border-b border-slate-700/70 bg-slate-950/60 backdrop-blur">
-        <div class="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
+        <div class="flex w-full items-center justify-between px-6 py-4">
           <h1 class="text-lg font-semibold tracking-tight">RXDB Server Workbench v{{ appVersion }}</h1>
 
           <div ref="dropdownRoot" class="relative">
@@ -952,7 +952,7 @@ function logout(): void {
       </header>
 
       <div class="mx-[30px] pt-4 pb-10">
-        <div class="max-h-[86vh] space-y-5 overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900/60 p-6">
+        <div class="max-h-[87.96vh] space-y-5 overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900/60 p-6">
           <h2 class="text-xl font-semibold">Welcome, {{ currentUsername }}</h2>
 
           <div class="flex items-end gap-1 border-b border-slate-700/70">
@@ -1057,6 +1057,7 @@ function logout(): void {
           <CollectionsTab
             v-show="activeTab === 'collections'"
             :collections="setupConfig?.effectiveServerSetup?.collections ?? []"
+            :active-server-id="setupConfig?.activeServerId ?? null"
             :schema-validation-enabled="setupConfig?.effectiveServerSetup?.schemaValidationEnabled ?? true"
             :schemas-by-collection="setupConfig?.effectiveServerSetup?.schemasByCollection ?? {}"
             :last-collection-change="lastCollectionChange"

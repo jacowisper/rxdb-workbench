@@ -951,6 +951,70 @@ function buildServerConfigResponse() {
   };
 }
 
+function sortObjectKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => sortObjectKeysDeep(entry));
+  }
+
+  if (!isPlainObject(value)) {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entryValue]) => [key, sortObjectKeysDeep(entryValue)])
+  );
+}
+
+function normalizeSetupForComparison(setup: ServerSetup): ServerSetup {
+  const collections = Array.from(new Set(setup.collections.map((name) => name.trim()).filter(Boolean))).sort((a, b) =>
+    a.localeCompare(b)
+  );
+
+  const collectionEndpoints = Object.fromEntries(
+    Object.entries(setup.collectionEndpoints)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([collection, endpoints]) => [
+        collection.trim(),
+        {
+          replEndpoint: endpoints.replEndpoint.trim(),
+          restEndpoint: endpoints.restEndpoint.trim()
+        }
+      ])
+  );
+
+  return {
+    ...setup,
+    serverIdentifier: setup.serverIdentifier.trim(),
+    url: setup.url.trim(),
+    port: setup.port.trim(),
+    mongodbConnectionString: setup.mongodbConnectionString.trim(),
+    authHeader: setup.authHeader.trim(),
+    collections,
+    collectionEndpoints: sortObjectKeysDeep(collectionEndpoints) as ServerSetup["collectionEndpoints"],
+    schemasByCollection: sortObjectKeysDeep(setup.schemasByCollection) as ServerSetup["schemasByCollection"]
+  };
+}
+
+function areServerSetupsEquivalent(left: ServerSetup, right: ServerSetup): boolean {
+  const normalizedLeft = normalizeSetupForComparison(left);
+  const normalizedRight = normalizeSetupForComparison(right);
+  return JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight);
+}
+
+function hasPendingStagedConfig(config: BackendConfig): boolean {
+  if (!config.stagedServerSetup) {
+    return false;
+  }
+
+  if (!config.runningServerSetup) {
+    return true;
+  }
+
+  return !areServerSetupsEquivalent(config.stagedServerSetup, config.runningServerSetup);
+}
+
 app.use(cors());
 app.use(express.json({ limit: backendJsonBodyLimit }));
 
@@ -1044,12 +1108,28 @@ app.post("/api/server/select", async (req, res) => {
   }
 
   try {
-    if (runtimeController.getState() === "running") {
+    const wasRuntimeActive = runtimeController.getState() !== "stopped";
+    if (wasRuntimeActive) {
       await runtimeController.stop();
     }
     if (!setActiveServer(backendConfig, serverId)) {
       return res.status(404).json({ error: "Server not found." });
     }
+
+    const selectedSetup = backendConfig.serverCatalog[serverId]?.setup;
+    if (wasRuntimeActive && isValidServerSetup(selectedSetup)) {
+      await runtimeController.start(selectedSetup);
+      backendConfig.runningServerSetup = cloneServerSetup(selectedSetup);
+      backendConfig.stagedServerSetup = null;
+      backendConfig.runtime.status = "running";
+      saveActiveSetupToCatalog(backendConfig);
+    } else if (isValidServerSetup(selectedSetup)) {
+      // Selecting a server should not create pending staged changes by itself.
+      backendConfig.runningServerSetup = cloneServerSetup(selectedSetup);
+      backendConfig.stagedServerSetup = null;
+      backendConfig.runtime.status = "stopped";
+    }
+
     persistBackendConfig(backendConfig);
     broadcastServerStatus();
     return res.json({
@@ -1609,7 +1689,7 @@ function buildServerStatusMessage() {
     serverId: backendConfig.runtime.serverId,
     activeServerId: backendConfig.activeServerId,
     status: backendConfig.runtime.status,
-    hasStagedConfig: backendConfig.stagedServerSetup !== null,
+    hasStagedConfig: hasPendingStagedConfig(backendConfig),
     hasRunningConfig: backendConfig.runningServerSetup !== null,
     servers: getServerSummaries(backendConfig),
     replicationEndpointTest: backendConfig.replicationEndpointTest,
@@ -1672,6 +1752,10 @@ websocketServer.on("connection", (socket: WebSocket, request: IncomingMessage) =
     if (command.type === "server:deploy-staged-config") {
       if (!backendConfig.stagedServerSetup) {
         sendJson(socket, { type: "server:deploy-ignored", message: "No staged config to deploy." });
+        return;
+      }
+      if (!hasPendingStagedConfig(backendConfig)) {
+        sendJson(socket, { type: "server:deploy-ignored", message: "No staged changes to deploy." });
         return;
       }
 

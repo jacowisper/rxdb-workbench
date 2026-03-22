@@ -20,6 +20,7 @@ import JsonTreeNode from "./JsonTreeNode.vue";
 
 const props = defineProps<{
   collections: string[];
+  activeServerId: string | null;
   schemaValidationEnabled: boolean;
   schemasByCollection: Record<string, unknown>;
   lastCollectionChange: {
@@ -32,7 +33,7 @@ const props = defineProps<{
 }>();
 
 const selectedCollection = ref<string | null>(null);
-const queryInput = ref("");
+const queryInput = ref(loadQueryDraft());
 const appliedQuery = ref("");
 const selectedCollectionCount = ref<number | null>(null);
 const loadingCount = ref(false);
@@ -57,7 +58,59 @@ const removeDocsError = ref("");
 const unfilteredCollectionCount = ref<number | null>(null);
 const currentPage = ref(1);
 const pageSize = 100;
-const selectedColumns = ref(1);
+const LAST_COLUMNS_KEY = "rxdbwb_last_columns_setting";
+const QUERY_DRAFT_KEY = "rxdbwb_query_draft";
+
+function loadQueryDraft(): string {
+  try {
+    return window.localStorage.getItem(QUERY_DRAFT_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function saveQueryDraft(value: string): void {
+  try {
+    window.localStorage.setItem(QUERY_DRAFT_KEY, value);
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+function clearQueryDraft(): void {
+  try {
+    window.localStorage.removeItem(QUERY_DRAFT_KEY);
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+function loadLastColumnsSetting(): number {
+  try {
+    const raw = window.localStorage.getItem(LAST_COLUMNS_KEY);
+    if (!raw) {
+      return 1;
+    }
+
+    const parsed = Number.parseInt(raw, 10);
+    if (parsed === 1 || parsed === 2 || parsed === 3) {
+      return parsed;
+    }
+    return 1;
+  } catch {
+    return 1;
+  }
+}
+
+function saveLastColumnsSetting(value: number): void {
+  try {
+    window.localStorage.setItem(LAST_COLUMNS_KEY, String(value));
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+const selectedColumns = ref(loadLastColumnsSetting());
 const markedDeleteDocKeys = ref<Set<string>>(new Set());
 const editDocEditorHost = ref<HTMLDivElement | null>(null);
 let collectionChangeRefreshTimer: number | null = null;
@@ -71,6 +124,49 @@ let isSyncingEditorFromModel = false;
 const collectionOptions = computed(() =>
   Array.from(new Set(props.collections.map((name) => name.trim()).filter(Boolean)))
 );
+const LAST_COLLECTION_BY_SERVER_KEY = "rxdbwb_last_collection_by_server";
+
+function loadLastCollectionByServer(): Record<string, string> {
+  try {
+    const raw = window.localStorage.getItem(LAST_COLLECTION_BY_SERVER_KEY);
+    if (!raw) {
+      return {};
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+
+    return Object.fromEntries(
+      Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string")
+    );
+  } catch {
+    return {};
+  }
+}
+
+function saveLastCollectionByServer(mapping: Record<string, string>): void {
+  try {
+    window.localStorage.setItem(LAST_COLLECTION_BY_SERVER_KEY, JSON.stringify(mapping));
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+const isQueryJsonInvalid = computed(() => {
+  const value = queryInput.value.trim();
+  if (!value) {
+    return false;
+  }
+
+  try {
+    JSON.parse(value);
+    return false;
+  } catch {
+    return true;
+  }
+});
 
 async function refreshSelectedCollectionCount(): Promise<void> {
   if (!selectedCollection.value) {
@@ -691,13 +787,34 @@ function fillQueryFromKeyPath(path: string): void {
 }
 
 watch(selectedCollection, async () => {
+  const serverId = props.activeServerId?.trim();
+  const collectionName = selectedCollection.value?.trim();
+  if (serverId && collectionName) {
+    const mapping = loadLastCollectionByServer();
+    mapping[serverId] = collectionName;
+    saveLastCollectionByServer(mapping);
+  }
+
   closeDocEditModal();
-  queryInput.value = "";
-  appliedQuery.value = "";
   removeDocsError.value = "";
   currentPage.value = 1;
   await refreshSelectedCollectionCount();
   await refreshSelectedCollectionDocs();
+});
+
+watch(selectedColumns, (value) => {
+  saveLastColumnsSetting(value);
+});
+
+watch([queryInput, appliedQuery], ([input, applied]) => {
+  const normalizedInput = input.trim();
+  const normalizedApplied = applied.trim();
+  if (normalizedInput && normalizedInput !== normalizedApplied) {
+    saveQueryDraft(input);
+    return;
+  }
+
+  clearQueryDraft();
 });
 
 watch(editDocJson, () => {
@@ -755,6 +872,37 @@ watch(
       await refreshSelectedCollectionDocs();
     }, 200);
   }
+);
+
+watch(
+  () => props.activeServerId,
+  async () => {
+    closeDocEditModal();
+    removeDocsError.value = "";
+    currentPage.value = 1;
+    markedDeleteDocKeys.value = new Set();
+
+    const options = collectionOptions.value;
+    const serverId = props.activeServerId?.trim() ?? "";
+    const mapping = loadLastCollectionByServer();
+    const remembered = serverId ? mapping[serverId]?.trim() ?? "" : "";
+    const current = selectedCollection.value?.trim() ?? "";
+
+    if (remembered && options.includes(remembered)) {
+      selectedCollection.value = remembered;
+      return;
+    }
+
+    const hasCurrent = current.length > 0 && options.includes(current);
+    if (!hasCurrent) {
+      selectedCollection.value = options[0] ?? null;
+      return;
+    }
+
+    await refreshSelectedCollectionCount();
+    await refreshSelectedCollectionDocs();
+  },
+  { immediate: true }
 );
 
 onBeforeUnmount(() => {
@@ -815,7 +963,12 @@ onBeforeUnmount(() => {
           id="collection-query-input"
           v-model="queryInput"
           type="text"
-          class="w-full rounded-l-lg rounded-r-none border border-r-0 border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:border-sky-500 focus:outline-none"
+          class="w-full rounded-l-lg rounded-r-none border border-r-0 bg-slate-950 px-3 py-2 text-sm text-slate-100 focus:outline-none"
+          :class="
+            isQueryJsonInvalid
+              ? 'border-rose-500 focus:border-rose-500'
+              : 'border-slate-700 focus:border-sky-500'
+          "
           @keydown.enter.prevent="submitQuery"
         />
         <button
