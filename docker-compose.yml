@@ -1,4 +1,4 @@
-services:
+﻿services:
   mongodb:
     image: mongodb/mongodb-community-server:latest
     container_name: modest_shirley
@@ -40,6 +40,7 @@ services:
         VITE_FRONTEND_TO_USE_BACKEND_URL: "${VITE_FRONTEND_TO_USE_BACKEND_URL:-http://localhost:4000}"
         VITE_FRONTEND_TO_USE_BACKEND_WEBSOCKET_PORT: "${VITE_FRONTEND_TO_USE_BACKEND_WEBSOCKET_PORT:-4001}"
         VITE_FRONTEND_DEFAULT_MONGODB_CONNECTION_STRING: "${VITE_FRONTEND_DEFAULT_MONGODB_CONNECTION_STRING:-mongodb://rxdbadmin:rxdbpass@mongodb:27017/rxdb-workbench?authSource=admin}"
+        VITE_INTERNAL_MODE: "${VITE_INTERNAL_MODE:-}"
     depends_on:
       - mongodb
       - backend
@@ -50,3 +51,4 @@ services:
 volumes:
   backend-data:
   mongo-data:
+

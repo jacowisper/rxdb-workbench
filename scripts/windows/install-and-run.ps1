@@ -366,6 +366,7 @@ try {
 
   $defaults = @{
     RXDB_PREMIUM = ""
+    BACKEND_GITHUB_SERVER_SCHEMAS_URL = ""
     BACKEND_TOKEN = "85533878a62652c01f764ba4d7e154ddaf6e7"
     BACKEND_PORT = "4000"
     BACKEND_DEFAULT_WEBSOCKET_PORT = "4001"
@@ -381,6 +382,9 @@ try {
     if ($existing.ContainsKey($key) -and $existing[$key] -ne $null -and $existing[$key] -ne "") {
       $defaults[$key] = [string]$existing[$key]
     }
+  }
+  if ($existing.ContainsKey("BACKEND_GITHUB_SERVER_SCHEMAS_URL")) {
+    $defaults["BACKEND_GITHUB_SERVER_SCHEMAS_URL"] = [string]$existing["BACKEND_GITHUB_SERVER_SCHEMAS_URL"]
   }
 
   Write-Step "Configuring environment"
@@ -418,8 +422,28 @@ try {
   $defaults["BACKEND_DEFAULT_MONGODB_CONNECTION_STRING"] = $mongoConnectionString
   $defaults["VITE_FRONTEND_DEFAULT_MONGODB_CONNECTION_STRING"] = $mongoConnectionString
 
+  $managedEnvKeys = @(
+    "RXDB_PREMIUM",
+    "BACKEND_GITHUB_SERVER_SCHEMAS_URL",
+    "BACKEND_TOKEN",
+    "BACKEND_PORT",
+    "BACKEND_DEFAULT_WEBSOCKET_PORT",
+    "BACKEND_JSON_BODY_LIMIT",
+    "VITE_FRONTEND_TO_USE_FORBACKEND_TOKEN",
+    "VITE_FRONTEND_TO_USE_BACKEND_URL",
+    "VITE_FRONTEND_TO_USE_BACKEND_WEBSOCKET_PORT",
+    "VITE_FRONTEND_DEFAULT_MONGODB_CONNECTION_STRING",
+    "BACKEND_DEFAULT_MONGODB_CONNECTION_STRING",
+    "FRONTEND_PORT",
+    "MONGO_PORT",
+    "MONGO_INITDB_ROOT_USERNAME",
+    "MONGO_INITDB_ROOT_PASSWORD",
+    "MONGO_INITDB_DATABASE"
+  )
+
   $envLines = @(
     "RXDB_PREMIUM=$($defaults["RXDB_PREMIUM"])",
+    "BACKEND_GITHUB_SERVER_SCHEMAS_URL=$($defaults["BACKEND_GITHUB_SERVER_SCHEMAS_URL"])",
     "BACKEND_TOKEN=$($defaults["BACKEND_TOKEN"])",
     "BACKEND_PORT=$($defaults["BACKEND_PORT"])",
     "BACKEND_DEFAULT_WEBSOCKET_PORT=$($defaults["BACKEND_DEFAULT_WEBSOCKET_PORT"])",
@@ -435,8 +459,21 @@ try {
     "MONGO_INITDB_ROOT_PASSWORD=$($defaults["MONGO_INITDB_ROOT_PASSWORD"])",
     "MONGO_INITDB_DATABASE=$($defaults["MONGO_INITDB_DATABASE"])"
   )
+
+  $preservedKeys = @(
+    $existing.Keys |
+      Where-Object { $managedEnvKeys -notcontains [string]$_ } |
+      Sort-Object
+  )
+  foreach ($key in $preservedKeys) {
+    $envLines += "$key=$($existing[$key])"
+  }
+
   Set-Content -LiteralPath $envPath -Value $envLines -Encoding ASCII
   Write-Host "Wrote $envPath"
+  if ($preservedKeys.Count -gt 0) {
+    Write-Host "Preserved additional .env keys: $($preservedKeys -join ", ")"
+  }
 
   Write-Step "Building and starting containers"
   $composeResult = Invoke-Process -FileName "docker" -Arguments @("compose", "--progress", "plain", "up", "-d", "--build")

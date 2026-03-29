@@ -21,6 +21,9 @@ import JsonTreeNode from "./JsonTreeNode.vue";
 const props = defineProps<{
   collections: string[];
   activeServerId: string | null;
+  rxdbServerUrl: string;
+  rxdbServerPort: string;
+  rxdbServerAuthHeader: string;
   schemaValidationEnabled: boolean;
   schemasByCollection: Record<string, unknown>;
   lastCollectionChange: {
@@ -50,6 +53,7 @@ const isResettingCollection = ref(false);
 const isApplyingDocEdit = ref(false);
 const isRemovingDocs = ref(false);
 const editDocIndex = ref<number | null>(null);
+const isCreatingDoc = ref(false);
 const editDocCollectionName = ref<string | null>(null);
 const editDocJson = ref("");
 const editDocError = ref("");
@@ -114,6 +118,11 @@ const selectedColumns = ref(loadLastColumnsSetting());
 const markedDeleteDocKeys = ref<Set<string>>(new Set());
 const editDocEditorHost = ref<HTMLDivElement | null>(null);
 let collectionChangeRefreshTimer: number | null = null;
+let backgroundResyncTimer: number | null = null;
+let msseAbortController: AbortController | null = null;
+let msseCollectionKey: string | null = null;
+let msseDebounceTimer: number | null = null;
+const resyncInFlightCollections = new Set<string>();
 let countRequestId = 0;
 let docsRequestId = 0;
 const ajv = new Ajv({ allErrors: true, strict: false });
@@ -344,6 +353,7 @@ function openDocEditModal(docIndex: number): void {
     return;
   }
 
+  isCreatingDoc.value = false;
   editDocIndex.value = docIndex;
   editDocCollectionName.value = selectedCollection.value?.trim() || null;
   editDocJson.value = JSON.stringify(doc, null, 2);
@@ -353,8 +363,102 @@ function openDocEditModal(docIndex: number): void {
   parseEditedDocInput();
 }
 
+function resolveSchemaType(schema: Record<string, unknown>): string | null {
+  const rawType = schema.type;
+  if (typeof rawType === "string") {
+    return rawType;
+  }
+  if (Array.isArray(rawType)) {
+    const preferred = rawType.find((entry): entry is string => typeof entry === "string" && entry !== "null");
+    return preferred ?? null;
+  }
+  return null;
+}
+
+function createDefaultValueFromSchema(schema: unknown): unknown {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return null;
+  }
+
+  const cast = schema as Record<string, unknown>;
+
+  if (cast.default !== undefined) {
+    return cast.default;
+  }
+
+  if (Array.isArray(cast.enum) && cast.enum.length > 0) {
+    return cast.enum[0];
+  }
+
+  const normalizedType = resolveSchemaType(cast);
+  if (normalizedType === "object") {
+    const properties = cast.properties;
+    if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
+      return {};
+    }
+
+    const next: Record<string, unknown> = {};
+    for (const [key, childSchema] of Object.entries(properties as Record<string, unknown>)) {
+      const childValue = createDefaultValueFromSchema(childSchema);
+      if (childValue !== null) {
+        next[key] = childValue;
+      }
+    }
+    return next;
+  }
+
+  if (normalizedType === "array") {
+    return [];
+  }
+
+  if (normalizedType === "string") {
+    return "";
+  }
+
+  if (normalizedType === "number" || normalizedType === "integer") {
+    return 0;
+  }
+
+  if (normalizedType === "boolean") {
+    return false;
+  }
+
+  return null;
+}
+
+function createSchemaDerivedBlankDocument(collectionName: string): Record<string, unknown> {
+  const schema = props.schemasByCollection[collectionName];
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return {};
+  }
+
+  const rootValue = createDefaultValueFromSchema(schema);
+  if (rootValue && typeof rootValue === "object" && !Array.isArray(rootValue)) {
+    return rootValue as Record<string, unknown>;
+  }
+
+  return {};
+}
+
+function openAddDocModal(): void {
+  const collectionName = selectedCollection.value?.trim();
+  if (!collectionName) {
+    return;
+  }
+
+  isCreatingDoc.value = true;
+  editDocIndex.value = null;
+  editDocCollectionName.value = collectionName;
+  editDocJson.value = JSON.stringify(createSchemaDerivedBlankDocument(collectionName), null, 2);
+  editDocError.value = "";
+  isEditDocJsonValid.value = true;
+  isDocEditModalOpen.value = true;
+  parseEditedDocInput();
+}
+
 function closeDocEditModal(): void {
   isDocEditModalOpen.value = false;
+  isCreatingDoc.value = false;
   editDocIndex.value = null;
   editDocCollectionName.value = null;
   editDocJson.value = "";
@@ -476,12 +580,6 @@ function validateDocumentAgainstCollectionSchema(collectionName: string, doc: Re
 }
 
 async function applyDocEdit(): Promise<void> {
-  const index = editDocIndex.value;
-  if (index === null || index < 0 || index >= collectionDocs.value.length) {
-    closeDocEditModal();
-    return;
-  }
-
   const parsedDoc = parseEditedDocInput();
   if (!parsedDoc) {
     return;
@@ -494,12 +592,19 @@ async function applyDocEdit(): Promise<void> {
 
   isApplyingDocEdit.value = true;
   try {
-    console.log("[Collection doc edit] apply requested", { collectionName, index });
+    const index = editDocIndex.value;
+    const mode = isCreatingDoc.value ? "create" : "edit";
+    console.log("[Collection doc edit] apply requested", { collectionName, index, mode });
     const savedDoc = await upsertCollectionDocument(collectionName, parsedDoc);
-    console.log("[Collection doc edit] apply completed", { collectionName, index });
-    const next = [...collectionDocs.value];
-    next[index] = savedDoc;
-    collectionDocs.value = next;
+    console.log("[Collection doc edit] apply completed", { collectionName, index, mode });
+    if (!isCreatingDoc.value && index !== null && index >= 0 && index < collectionDocs.value.length) {
+      const next = [...collectionDocs.value];
+      next[index] = savedDoc;
+      collectionDocs.value = next;
+    } else {
+      await refreshSelectedCollectionCount();
+      await refreshSelectedCollectionDocs();
+    }
     closeDocEditModal();
   } catch (error) {
     console.error("[Collection doc edit] apply failed", error);
@@ -667,13 +772,21 @@ async function exportCompleteCollectionData(): Promise<void> {
 }
 
 async function triggerResyncCollection(): Promise<void> {
-  await triggerResyncCollectionWithOptions();
+  const collectionName = selectedCollection.value?.trim();
+  if (!collectionName) {
+    return;
+  }
+  await triggerResyncForCollectionIfNotRunning(collectionName);
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
+}
+
+function normalizeCollectionKey(collectionName: string): string {
+  return collectionName.trim().toLowerCase();
 }
 
 function isAlreadyRunningResyncMessage(message: string): boolean {
@@ -685,13 +798,45 @@ function isRuntimeUnavailableForResync(message: string): boolean {
 }
 
 async function runResyncRequest(collectionName: string): Promise<void> {
+  const normalizedTarget = normalizeCollectionKey(collectionName);
+  const isTargetStillSelected = (): boolean => (selectedCollection.value?.trim().toLowerCase() ?? "") === normalizedTarget;
+
   const count = await resyncCollection(collectionName);
+  if (!isTargetStillSelected()) {
+    return;
+  }
+
   if (count !== null) {
     selectedCollectionCount.value = count;
   } else {
     await refreshSelectedCollectionCount();
   }
+
+  if (!isTargetStillSelected()) {
+    return;
+  }
   await refreshSelectedCollectionDocs();
+}
+
+async function triggerResyncForCollectionIfNotRunning(
+  collectionName: string,
+  options?: { retryUntilRuntimeReady?: boolean }
+): Promise<boolean> {
+  const normalized = normalizeCollectionKey(collectionName);
+  if (!normalized || resyncInFlightCollections.has(normalized)) {
+    return false;
+  }
+
+  resyncInFlightCollections.add(normalized);
+  try {
+    await triggerResyncCollectionWithOptions({
+      collectionName,
+      retryUntilRuntimeReady: options?.retryUntilRuntimeReady
+    });
+    return true;
+  } finally {
+    resyncInFlightCollections.delete(normalized);
+  }
 }
 
 async function triggerResyncCollectionWithOptions(options?: { collectionName?: string; retryUntilRuntimeReady?: boolean }): Promise<void> {
@@ -734,6 +879,185 @@ async function triggerResyncCollectionWithOptions(options?: { collectionName?: s
     }
   } finally {
     isResyncing.value = false;
+  }
+}
+
+function stopBackgroundResyncInterval(): void {
+  if (backgroundResyncTimer !== null) {
+    window.clearInterval(backgroundResyncTimer);
+    backgroundResyncTimer = null;
+  }
+}
+
+function runBackgroundResyncTick(): void {
+  const collectionName = selectedCollection.value?.trim();
+  if (!collectionName) {
+    return;
+  }
+
+  const normalized = normalizeCollectionKey(collectionName);
+  if (resyncInFlightCollections.has(normalized)) {
+    return;
+  }
+
+  void triggerResyncForCollectionIfNotRunning(collectionName)
+    .catch(() => {
+      // Ignore background resync failures; foreground actions will surface errors where relevant.
+    });
+}
+
+function restartBackgroundResyncInterval(): void {
+  stopBackgroundResyncInterval();
+  const collectionName = selectedCollection.value?.trim();
+  if (!collectionName) {
+    return;
+  }
+
+  backgroundResyncTimer = window.setInterval(() => {
+    runBackgroundResyncTick();
+  }, 60_000);
+}
+
+function clearMsseDebounceTimer(): void {
+  if (msseDebounceTimer !== null) {
+    window.clearTimeout(msseDebounceTimer);
+    msseDebounceTimer = null;
+  }
+}
+
+function stopCollectionMsseSubscription(): void {
+  clearMsseDebounceTimer();
+  msseCollectionKey = null;
+  if (msseAbortController) {
+    msseAbortController.abort();
+    msseAbortController = null;
+  }
+}
+
+function buildMsseUrl(collectionName: string): string | null {
+  const baseUrlRaw = props.rxdbServerUrl.trim();
+  const portRaw = props.rxdbServerPort.trim();
+  if (!baseUrlRaw) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(baseUrlRaw.includes("://") ? baseUrlRaw : `http://${baseUrlRaw}`);
+    if (portRaw) {
+      parsed.port = portRaw;
+    }
+    parsed.pathname = "/msse";
+    parsed.search = "";
+    parsed.searchParams.set("collection", collectionName);
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function scheduleMsseDebouncedResync(collectionName: string): void {
+  clearMsseDebounceTimer();
+  msseDebounceTimer = window.setTimeout(() => {
+    msseDebounceTimer = null;
+    const selected = selectedCollection.value?.trim();
+    if (!selected || normalizeCollectionKey(selected) !== normalizeCollectionKey(collectionName)) {
+      return;
+    }
+
+    void triggerResyncForCollectionIfNotRunning(collectionName).catch(() => {
+      // Ignore background/debounced resync failures.
+    });
+  }, 450);
+}
+
+function processMsseBuffer(buffer: string, collectionName: string): string {
+  const normalized = buffer.replace(/\r\n/g, "\n");
+  const blocks = normalized.split("\n\n");
+  const incompleteBlock = blocks.pop() ?? "";
+
+  for (const block of blocks) {
+    const lines = block
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length === 0) {
+      continue;
+    }
+
+    const hasCommentOnly = lines.every((line) => line.startsWith(":"));
+    if (hasCommentOnly) {
+      continue;
+    }
+
+    const hasDataLine = lines.some((line) => line.startsWith("data:"));
+    if (hasDataLine || lines.length > 0) {
+      scheduleMsseDebouncedResync(collectionName);
+    }
+  }
+
+  return incompleteBlock;
+}
+
+async function startCollectionMsseSubscription(collectionName: string): Promise<void> {
+  stopCollectionMsseSubscription();
+
+  const authHeader = props.rxdbServerAuthHeader.trim();
+  const msseUrl = buildMsseUrl(collectionName);
+  if (!authHeader || !msseUrl) {
+    restartBackgroundResyncInterval();
+    return;
+  }
+
+  const normalized = normalizeCollectionKey(collectionName);
+  const controller = new AbortController();
+  msseAbortController = controller;
+  msseCollectionKey = normalized;
+
+  try {
+    const response = await fetch(msseUrl, {
+      method: "GET",
+      headers: {
+        Authorization: authHeader
+      },
+      signal: controller.signal
+    });
+
+    if (!response.ok || !response.body) {
+      throw new Error(`MSSE subscribe failed with status ${response.status}.`);
+    }
+
+    // Active stream means polling fallback can stay off.
+    stopBackgroundResyncInterval();
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        throw new Error("MSSE stream ended.");
+      }
+
+      if (msseCollectionKey !== normalized) {
+        return;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      buffer = processMsseBuffer(buffer, collectionName);
+    }
+  } catch {
+    if (controller.signal.aborted) {
+      return;
+    }
+
+    if (msseCollectionKey === normalized) {
+      msseCollectionKey = null;
+      restartBackgroundResyncInterval();
+    }
+  } finally {
+    if (msseAbortController === controller) {
+      msseAbortController = null;
+    }
   }
 }
 
@@ -797,9 +1121,21 @@ watch(selectedCollection, async () => {
 
   closeDocEditModal();
   removeDocsError.value = "";
+  queryInput.value = "";
+  appliedQuery.value = "";
+  clearQueryDraft();
   currentPage.value = 1;
   await refreshSelectedCollectionCount();
   await refreshSelectedCollectionDocs();
+
+  if (collectionName) {
+    // Run a non-blocking sync so newly selected collections fetch latest server state.
+    void triggerResyncForCollectionIfNotRunning(collectionName);
+    void startCollectionMsseSubscription(collectionName);
+  } else {
+    stopCollectionMsseSubscription();
+    stopBackgroundResyncInterval();
+  }
 });
 
 watch(selectedColumns, (value) => {
@@ -877,6 +1213,9 @@ watch(
 watch(
   () => props.activeServerId,
   async () => {
+    stopCollectionMsseSubscription();
+    stopBackgroundResyncInterval();
+    resyncInFlightCollections.clear();
     closeDocEditModal();
     removeDocsError.value = "";
     currentPage.value = 1;
@@ -906,7 +1245,9 @@ watch(
 );
 
 onBeforeUnmount(() => {
+  stopCollectionMsseSubscription();
   destroyEditDocEditor();
+  stopBackgroundResyncInterval();
   if (collectionChangeRefreshTimer !== null) {
     window.clearTimeout(collectionChangeRefreshTimer);
     collectionChangeRefreshTimer = null;
@@ -983,7 +1324,12 @@ onBeforeUnmount(() => {
 
     <div class="mt-4 rounded-lg border border-slate-700 bg-slate-950/60 p-3">
       <div class="mb-3 flex flex-wrap items-center gap-2">
-        <button type="button" class="inline-flex items-center gap-1 rounded-lg border border-emerald-500/60 bg-emerald-700/20 px-3 py-1.5 text-xs font-medium text-emerald-200">
+        <button
+          type="button"
+          class="inline-flex items-center gap-1 rounded-lg border border-emerald-500/60 bg-emerald-700/20 px-3 py-1.5 text-xs font-medium text-emerald-200 transition hover:bg-emerald-700/30 disabled:cursor-not-allowed disabled:opacity-50"
+          :disabled="!selectedCollection || isApplyingDocEdit"
+          @click="openAddDocModal"
+        >
           <Plus class="h-3.5 w-3.5" aria-hidden="true" />
           <span>ADD DATA</span>
         </button>
@@ -1097,7 +1443,7 @@ onBeforeUnmount(() => {
 
     <div v-if="isDocEditModalOpen" class="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-black/60 px-4 py-4 sm:items-center">
       <div class="my-auto w-full max-w-3xl max-h-[calc(100vh-2rem)] overflow-y-auto rounded-xl border border-slate-700 bg-slate-900 p-5 shadow-2xl shadow-black/40">
-        <h3 class="text-lg font-semibold tracking-tight text-slate-100">Edit Document</h3>
+        <h3 class="text-lg font-semibold tracking-tight text-slate-100">{{ isCreatingDoc ? "Add Document" : "Edit Document" }}</h3>
         <div
           ref="editDocEditorHost"
           class="mt-4 min-h-[22rem] w-full overflow-hidden rounded-lg border border-slate-700 bg-slate-950 text-xs"

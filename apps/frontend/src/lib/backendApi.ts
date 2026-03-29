@@ -62,6 +62,11 @@ export type ServerConfigResponse = {
   servers: ServerSummary[];
 };
 
+export type ImportableServerSchemasResponse = {
+  collections: string[];
+  schemasByCollection: Record<string, unknown>;
+};
+
 function getAuthHeader(): string {
   const token = import.meta.env.VITE_FRONTEND_TO_USE_FORBACKEND_TOKEN;
   if (!token) {
@@ -255,6 +260,27 @@ export async function upsertServerSchema(collection: string, schema: unknown): P
 
 export async function removeServerSchema(collection: string): Promise<void> {
   await post("/api/server/schema/remove", { collection });
+}
+
+export async function getImportableServerSchemas(): Promise<ImportableServerSchemasResponse> {
+  const result = await post("/api/server/schema/import/list");
+  const value = (typeof result === "object" && result !== null ? result : {}) as {
+    collections?: unknown;
+    schemasByCollection?: unknown;
+  };
+
+  const collections = Array.isArray(value.collections)
+    ? value.collections.filter((entry): entry is string => typeof entry === "string").map((entry) => entry.trim()).filter(Boolean)
+    : [];
+  const schemasByCollection =
+    value.schemasByCollection && typeof value.schemasByCollection === "object" && !Array.isArray(value.schemasByCollection)
+      ? (value.schemasByCollection as Record<string, unknown>)
+      : {};
+
+  return {
+    collections,
+    schemasByCollection
+  };
 }
 
 export async function validateDeploy(): Promise<DeployValidationResult> {

@@ -27,6 +27,9 @@ const defaultWebsocketPort = Number(
 const backendJsonBodyLimit = process.env.BACKEND_JSON_BODY_LIMIT ?? "10mb";
 const backendRuntimeLogWebhookUrl = process.env.BACKEND_RUNTIME_LOG_WEBHOOK_URL ?? "";
 const backendDefaultMongoConnectionString = process.env.BACKEND_DEFAULT_MONGODB_CONNECTION_STRING ?? "";
+const githubImportToken = process.env.GITKEY ?? "";
+const backendGithubServerSchemasUrl =
+  process.env.BACKEND_GITHUB_SERVER_SCHEMAS_URL?.trim() ?? "";
 const backendToken =
   process.env.BACKEND_TOKEN ?? process.env.BACKENDTOKEN ?? process.env["Backend Token"] ?? "";
 
@@ -951,6 +954,36 @@ function buildServerConfigResponse() {
   };
 }
 
+async function fetchGithubServerSchemas(): Promise<Record<string, unknown>> {
+  if (!backendGithubServerSchemasUrl) {
+    return {};
+  }
+
+  if (!githubImportToken.trim()) {
+    throw new Error("Missing GITKEY in environment.");
+  }
+
+  const response = await fetch(backendGithubServerSchemasUrl, {
+    method: "GET",
+    headers: {
+      Accept: "application/vnd.github.raw+json",
+      Authorization: `Bearer ${githubImportToken}`,
+      "User-Agent": "rxdb-server-workbench"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`GitHub schema fetch failed (${response.status}).`);
+  }
+
+  const payload = (await response.json().catch(() => null)) as unknown;
+  if (!isPlainObject(payload)) {
+    throw new Error("Invalid schema payload from GitHub.");
+  }
+
+  return payload;
+}
+
 function sortObjectKeysDeep(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map((entry) => sortObjectKeysDeep(entry));
@@ -1350,6 +1383,26 @@ app.post("/api/server/schema/get", (req, res) => {
     collection,
     schema: Object.prototype.hasOwnProperty.call(schemas, collection) ? schemas[collection] : null
   });
+});
+
+app.post("/api/server/schema/import/list", async (_req, res) => {
+  try {
+    const schemasByCollection = await fetchGithubServerSchemas();
+    const collections = Object.keys(schemasByCollection)
+      .map((name) => name.trim())
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b));
+
+    return res.json({
+      ok: true,
+      collections,
+      schemasByCollection
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : "Failed to fetch importable schemas."
+    });
+  }
 });
 
 app.post("/api/server/schema/upsert", (req, res) => {

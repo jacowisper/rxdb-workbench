@@ -61,11 +61,48 @@ const scalarValueLabel = computed(() => {
   return String(value);
 });
 
+const urlValue = computed(() => {
+  const value = props.value;
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      return parsed.toString();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+});
+
+const isUrlScalar = computed(() => Boolean(urlValue.value) && !hasChildren.value);
+
 function onLeafKeyClick(): void {
   if (hasChildren.value) {
     return;
   }
   emit("select-leaf-key", currentPath.value);
+}
+
+function onScalarValueClick(event: MouseEvent): void {
+  if (!isUrlScalar.value || !urlValue.value) {
+    return;
+  }
+
+  // Keep normal click as non-navigation; only follow links with Ctrl/Cmd click.
+  if (!(event.ctrlKey || event.metaKey)) {
+    return;
+  }
+
+  window.open(urlValue.value, "_blank", "noopener,noreferrer");
 }
 </script>
 
@@ -92,6 +129,15 @@ function onLeafKeyClick(): void {
         {{ props.label }}:
       </button>
       <span v-if="hasChildren" class="text-cyan-300">{{ typeLabel }}</span>
+      <button
+        v-else-if="isUrlScalar"
+        type="button"
+        class="cursor-pointer text-left text-sky-300 underline decoration-dotted underline-offset-2 transition hover:text-sky-200"
+        title="Ctrl+Click (Cmd+Click on macOS) to open link"
+        @click="onScalarValueClick"
+      >
+        {{ scalarValueLabel }}
+      </button>
       <span v-else class="text-emerald-300">{{ scalarValueLabel }}</span>
     </div>
 

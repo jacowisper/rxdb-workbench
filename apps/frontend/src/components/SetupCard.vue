@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import Ajv from "ajv";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { json } from "@codemirror/lang-json";
 import { oneDark } from "@codemirror/theme-one-dark";
-import { removeServerSchema, stageServerConfig, upsertServerSchema, type ServerSetup } from "../lib/backendApi";
+import VSelect from "vue-select";
+import "vue-select/dist/vue-select.css";
+import { getImportableServerSchemas, removeServerSchema, stageServerConfig, upsertServerSchema, type ServerSetup } from "../lib/backendApi";
 
 const props = defineProps<{
   initialSetup: ServerSetup;
@@ -40,6 +42,13 @@ const schemasByCollection = ref<Record<string, unknown>>({});
 const pastedSchemasByCollection = ref<Record<string, string>>({});
 const pastedSchemaInput = ref("");
 const isPasteSchemaModalOpen = ref(false);
+const isImportCollectionsModalOpen = ref(false);
+const isImportCollectionsLoading = ref(false);
+const isImportCollectionsSelectOpen = ref(false);
+const importCollectionsError = ref("");
+const importableCollections = ref<string[]>([]);
+const importableSchemasByCollection = ref<Record<string, unknown>>({});
+const selectedImportCollections = ref<string[]>([]);
 const isSchemaValidationEnabled = ref(true);
 const isSchemaSectionInvalid = ref(false);
 const schemaEditorHost = ref<HTMLDivElement | null>(null);
@@ -72,6 +81,16 @@ const schemaAjv = new Ajv({ allErrors: true, strict: false, validateSchema: true
 let schemaEditorView: EditorView | null = null;
 let isSyncingSchemaEditorFromModel = false;
 
+const availableImportCollectionOptions = computed(() => {
+  const selected = new Set(selectedImportCollections.value);
+  const existing = new Set(collections.value);
+  return importableCollections.value.filter((name) => !selected.has(name) && !existing.has(name));
+});
+const isInternalModeEnabled = computed(() => {
+  const raw = (import.meta.env.VITE_INTERNAL_MODE ?? "").trim().toLowerCase();
+  return raw === "true" || raw === "tru" || raw === "1" || raw === "yes";
+});
+
 function loadFromSetup(setup: ServerSetup): void {
   serverIdentifier.value = setup.serverIdentifier;
   serverUrl.value = setup.url;
@@ -96,6 +115,12 @@ function loadFromSetup(setup: ServerSetup): void {
   pastedSchemasByCollection.value = {};
   pastedSchemaInput.value = "";
   isPasteSchemaModalOpen.value = false;
+  isImportCollectionsModalOpen.value = false;
+  isImportCollectionsLoading.value = false;
+  importCollectionsError.value = "";
+  importableCollections.value = [];
+  importableSchemasByCollection.value = {};
+  selectedImportCollections.value = [];
   isSchemaSectionInvalid.value = false;
   destroySchemaEditor();
   configError.value = "";
@@ -318,6 +343,71 @@ function clearCollectionInputs(): void {
   collectionReplEndpointInput.value = "";
   collectionRestEndpointInput.value = "";
   editingCollectionIndex.value = null;
+}
+
+async function openImportCollectionsModal(): Promise<void> {
+  isImportCollectionsModalOpen.value = true;
+  isImportCollectionsLoading.value = true;
+  isImportCollectionsSelectOpen.value = false;
+  importCollectionsError.value = "";
+  selectedImportCollections.value = [];
+  importableCollections.value = [];
+  importableSchemasByCollection.value = {};
+
+  // Let the modal render with final styles before starting network work.
+  await nextTick();
+  await new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+
+  try {
+    const result = await getImportableServerSchemas();
+    importableCollections.value = Array.from(new Set(result.collections.map((name) => name.trim()).filter(Boolean))).sort((a, b) =>
+      a.localeCompare(b)
+    );
+    importableSchemasByCollection.value = { ...result.schemasByCollection };
+  } catch (error) {
+    importCollectionsError.value = getApiErrorMessage(error, "Failed to fetch importable collections.");
+    importableCollections.value = [];
+    importableSchemasByCollection.value = {};
+  } finally {
+    isImportCollectionsLoading.value = false;
+  }
+}
+
+function closeImportCollectionsModal(): void {
+  isImportCollectionsModalOpen.value = false;
+  isImportCollectionsSelectOpen.value = false;
+  selectedImportCollections.value = [];
+  importCollectionsError.value = "";
+}
+
+function applyImportedCollections(): void {
+  const toImport = selectedImportCollections.value
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0 && !collections.value.includes(name));
+
+  if (toImport.length === 0) {
+    closeImportCollectionsModal();
+    return;
+  }
+
+  const nextCollections = [...collections.value];
+  for (const collectionName of toImport) {
+    nextCollections.push(collectionName);
+    collectionEndpoints.value[collectionName] = {
+      replEndpoint: buildDefaultReplEndpoint(collectionName),
+      restEndpoint: buildDefaultRestEndpoint(collectionName)
+    };
+    if (Object.prototype.hasOwnProperty.call(importableSchemasByCollection.value, collectionName)) {
+      schemasByCollection.value[collectionName] = importableSchemasByCollection.value[collectionName];
+    }
+  }
+
+  recordCollectionChange(nextCollections);
+  schemaTargetCollection.value = toImport[toImport.length - 1] ?? schemaTargetCollection.value;
+  syncSchemaValidationState();
+  closeImportCollectionsModal();
 }
 
 function commitPendingCollectionEndpointDraft(): void {
@@ -946,7 +1036,10 @@ function save(): void {
 </script>
 
 <template>
-  <div v-if="!isPasteSchemaModalOpen" class="fixed inset-0 z-20 flex items-start justify-center overflow-y-auto bg-black/60 px-4 py-4 sm:items-center">
+  <div
+    v-if="!isPasteSchemaModalOpen && !isImportCollectionsModalOpen"
+    class="fixed inset-0 z-20 flex items-start justify-center overflow-y-auto bg-black/60 px-4 py-4 sm:items-center"
+  >
     <div class="my-auto flex w-full max-w-5xl max-h-[calc(100vh-2rem)] flex-col overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl shadow-black/40">
       <h3 class="text-lg font-semibold tracking-tight">RxDB Server Setup</h3>
 
@@ -1025,7 +1118,17 @@ function save(): void {
 
       <div class="mt-6 max-h-56 overflow-auto rounded-lg border border-slate-700 p-3 pr-1">
         <div class="flex items-center justify-between gap-3">
-          <h4 class="text-sm font-semibold text-slate-100">Collections</h4>
+          <div class="flex items-center gap-2">
+            <h4 class="text-sm font-semibold text-slate-100">Collections</h4>
+            <button
+              v-if="isInternalModeEnabled"
+              type="button"
+              class="rounded border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] font-medium text-slate-200 transition hover:bg-slate-800"
+              @click="openImportCollectionsModal"
+            >
+              Import
+            </button>
+          </div>
           <label class="me-2 inline-flex items-center gap-2 text-xs text-slate-300">
             <input
               v-model="autoDeriveEndpoints"
@@ -1098,7 +1201,10 @@ function save(): void {
         </div>
       </div>
 
-      <div class="mt-6 max-h-64 overflow-auto rounded-lg border border-slate-700 p-3 pr-1" :class="{ 'is-invalid': isSchemaSectionInvalid }">
+      <div
+        class="mt-6 max-h-64 overflow-auto rounded-lg border border-slate-700 p-3 pr-1"
+        :class="{ 'is-invalid': isSchemaSectionInvalid }"
+      >
         <div class="mb-3 flex items-center justify-between text-sm">
           <span class="text-slate-200">Validation enabled</span>
           <div class="flex items-center">
@@ -1205,7 +1311,7 @@ function save(): void {
     </div>
   </div>
 
-  <div v-else class="fixed inset-0 z-20 flex items-start justify-center overflow-y-auto bg-black/60 px-4 py-4 sm:items-center">
+  <div v-else-if="isPasteSchemaModalOpen" class="fixed inset-0 z-20 flex items-start justify-center overflow-y-auto bg-black/60 px-4 py-4 sm:items-center">
     <div class="my-auto w-full max-w-6xl max-h-[calc(100vh-2rem)] overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl shadow-black/40">
       <h3 class="text-lg font-semibold tracking-tight">Edit Schema</h3>
       <p class="mt-1 text-sm text-slate-300">
@@ -1247,6 +1353,55 @@ function save(): void {
           @click="applyPastedSchema"
         >
           Apply Schema
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div v-else class="fixed inset-0 z-20 flex items-start justify-center overflow-y-auto bg-black/60 px-4 py-4 sm:items-center">
+    <div
+      class="my-auto w-full max-w-3xl max-h-[calc(100vh-2rem)] overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl shadow-black/40 transition-[height] duration-150"
+      :class="isImportCollectionsSelectOpen ? 'h-[60vh]' : 'h-[30vh]'"
+    >
+      <h3 class="text-lg font-semibold tracking-tight">Import Collections</h3>
+      <p class="mt-1 text-sm text-slate-300">Select one or more collections to import schemas and auto-derived endpoints.</p>
+
+      <div class="mt-4">
+        <VSelect
+          v-model="selectedImportCollections"
+          class="import-collections-select"
+          :options="availableImportCollectionOptions"
+          :multiple="true"
+          :close-on-select="false"
+          :clearable="true"
+          :disabled="isImportCollectionsLoading"
+          placeholder="Select collections to import"
+          @open="isImportCollectionsSelectOpen = true"
+          @close="isImportCollectionsSelectOpen = false"
+        />
+      </div>
+
+      <p v-if="isImportCollectionsLoading" class="mt-3 text-sm text-slate-300">Loading collections from GitHub...</p>
+      <p v-if="importCollectionsError" class="mt-3 text-sm text-rose-300">{{ importCollectionsError }}</p>
+      <p v-if="!isImportCollectionsLoading && availableImportCollectionOptions.length === 0" class="mt-3 text-sm text-slate-400">
+        No more collections available to import.
+      </p>
+
+      <div class="mt-4 flex items-center justify-end gap-2">
+        <button
+          type="button"
+          class="rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:bg-slate-800"
+          @click="closeImportCollectionsModal"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          class="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-60"
+          :disabled="isImportCollectionsLoading || selectedImportCollections.length === 0"
+          @click="applyImportedCollections"
+        >
+          Add Selected
         </button>
       </div>
     </div>
@@ -1309,6 +1464,48 @@ function save(): void {
 :deep(.cm-editor) {
   height: 22rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+:deep(.import-collections-select .vs__dropdown-toggle) {
+  background-color: rgb(2 6 23 / 1) !important;
+  border-color: rgb(51 65 85 / 1) !important;
+  min-height: 42px;
+}
+
+:deep(.import-collections-select .vs__selected) {
+  background-color: rgb(2 132 199 / 1);
+  border: 1px solid rgb(14 116 144 / 1);
+  color: rgb(255 255 255 / 1);
+  font-size: 0.9em;
+}
+
+:deep(.import-collections-select .vs__search),
+:deep(.import-collections-select .vs__search::placeholder) {
+  color: rgb(148 163 184 / 1);
+  background-color: transparent !important;
+}
+
+:deep(.import-collections-select .vs__open-indicator),
+:deep(.import-collections-select .vs__deselect) {
+  fill: rgb(148 163 184 / 1);
+}
+
+:deep(.import-collections-select .vs__deselect) {
+  fill: rgb(248 113 113 / 1);
+}
+
+:deep(.import-collections-select .vs__dropdown-menu) {
+  background-color: rgb(15 23 42 / 1);
+  border: 1px solid rgb(51 65 85 / 1);
+  color: rgb(226 232 240 / 1);
+}
+
+:deep(.import-collections-select .vs__dropdown-option) {
+  color: rgb(226 232 240 / 1);
+}
+
+:deep(.import-collections-select .vs__dropdown-option--highlight) {
+  background-color: rgb(30 41 59 / 1);
 }
 
 :deep(.cm-scroller) {
